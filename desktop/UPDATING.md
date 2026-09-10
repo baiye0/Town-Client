@@ -25,8 +25,8 @@
 
 - `npm version X.Y.Z --no-git-tag-version` 同步客户端与 lockfile 版本。
 - `npm run build:portal` 构建配套源码；`npm run make` 打包时从实际二进制读取版本、计算摘要并生成清单。不要复用未知来源或不对应源码的二进制。
-- `.github/workflows/release.yml` 在手动触发或版本 tag 时分别在 macOS ARM64 / Windows x64 上测试和构建，产物供审核后发布。不是自动公开上传。
-- 完整发布两个平台产物后再发布正式 `vX.Y.Z` Release；草稿和预发布不会提示用户更新。该首版不提供 Intel Mac 安装包。
+- `.github/workflows/release.yml` 手动触发时只测试和构建，用于发版前验证。确认后推送版本 tag：两个平台构建和 Windows 原生升级测试通过、包内引擎摘要核对后，先创建草稿并上传全部安装包、清单及摘要，最后公开为正式 Release。上传失败保留草稿。
+- 更新 `desktop/RELEASE_NOTES.md` 后再创建版本 tag；草稿和预发布不会提示用户更新。该首版不提供 Intel Mac 安装包。
 - 默认更新源为 `baiye0/Town-Client`。私有仓库无法匿名检测：应在构建时设置 `TOWN_UPDATE_REPOSITORY=owner/public-release-repo`（Actions 中使用同名 repository variable），只公开版本及二进制；不内置 GitHub token。保持私有时可在浏览器登录发布页下载。
 - 客户端手动安装，未使用自动下载/替换应用。macOS Developer ID、公证及 Windows Authenticode 仍需正式发布配置；SHA-256 检查只能校验包内一致性，不能代替签名和来源信任。
 

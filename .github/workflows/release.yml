@@ -51,5 +51,31 @@ jobs:
             resources/runtime-bundle.json
           if-no-files-found: error
           retention-days: 30
-# Artifacts are intentionally reviewed before publication. Publish both platforms
-# together as a non-prerelease vX.Y.Z release in TOWN_UPDATE_REPOSITORY.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Validate both packages and stage checksums
+        run: node scripts/stage-release.mjs artifacts release "${GITHUB_REF_NAME#v}"
+      - name: Publish the complete paired release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "Town-Client $GITHUB_REF_NAME" --notes-file desktop/RELEASE_NOTES.md
+          gh release upload "$GITHUB_REF_NAME" release/*
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+# Manual workflow runs only build and test. A version tag publishes after both
+# native builds pass; the release stays a draft if asset upload fails.

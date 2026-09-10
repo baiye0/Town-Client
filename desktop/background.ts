@@ -23,6 +23,9 @@ export const command: Command = (file, args, input) => new Promise((resolve, rej
 });
 const sh = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const ps = (value: string) => `'${value.replaceAll("'", "''")}'`;
+// A Node/Electron parent launched by pwsh inherits PS7 module paths. Native
+// Windows PowerShell must load its own compatible management/security modules.
+export const windowsModulePath = '$env:PSModulePath = "$PSHOME\\Modules"; ';
 const xml = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 16);
 export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; environment?: Record<string, string>; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string }
@@ -49,7 +52,7 @@ export function unixRunner(root: string, config: string, settings: Settings, env
 export function windowsRunner(root: string, config: string, settings: Settings, environment: Record<string, string> = {}): string {
   // The scheduled task owns this process tree; it has no client/Electron dependency.
   return `$ErrorActionPreference = 'Stop'\n$root = ${ps(root)}\n` +
-`${environmentEntries(environment).map(([key, value]) => `$env:${key}=${ps(value)}\n`).join('')}$env:PORTAL_CONNECT_LINK = [System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath (Join-Path $root 'connection.dpapi') -Raw | ConvertTo-SecureString)).Password
+`${environmentEntries(environment).map(([key, value]) => `$env:${key}=${ps(value)}\n`).join('')}${windowsModulePath}$env:PORTAL_CONNECT_LINK = [System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath (Join-Path $root 'connection.dpapi') -Raw | ConvertTo-SecureString)).Password
 $PID | Set-Content -LiteralPath (Join-Path $root 'supervisor.pid')
 $env:HEART_PORTAL_SUPERVISED = '1'
 $env:RUST_LOG = 'info'
@@ -121,7 +124,7 @@ export class BackgroundPortal {
   }
   private get domain() { return `gui/${process.getuid?.() ?? 0}`; }
   private powershell(script: string, input?: string) {
-    return this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from("$ErrorActionPreference='Stop'; " + script, 'utf16le').toString('base64')], input);
+    return this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(windowsModulePath + "$ErrorActionPreference='Stop'; " + script, 'utf16le').toString('base64')], input);
   }
   async discover(settings: Settings, connection: Connection | null) {
     this.connection = connection;

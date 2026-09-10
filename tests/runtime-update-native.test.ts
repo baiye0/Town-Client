@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile, copyFile, chmod } from 'node:fs/promi
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:net';
-import { BackgroundPortal, command } from '../desktop/background';
+import { BackgroundPortal, command, windowsModulePath } from '../desktop/background';
 import { RuntimeUpdater, digest, type RuntimeBundle } from '../desktop/runtime-update';
 import { parseConnection } from '../desktop/connection';
 import type { Settings } from '../desktop/shared';
@@ -51,7 +51,7 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
   } finally {
     await background.disable();
     if (process.platform === 'win32') {
-      const script = `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
+      const script = windowsModulePath + `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
       await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
     }
     await rm(root, { recursive: true, force: true });

@@ -2,7 +2,7 @@ import { expect, it } from 'vitest';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { BackgroundPortal, command } from '../desktop/background';
+import { BackgroundPortal, command, windowsModulePath } from '../desktop/background';
 import { parseConnection } from '../desktop/connection';
 
 it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || process.platform !== 'win32')('protects credentials and registers an interactive Windows task', async () => {
@@ -22,7 +22,7 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || process.platform !== 
     throw error;
   } finally {
     await background.disable();
-    const script = `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
+    const script = windowsModulePath + `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
     await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
     await rm(root, { recursive: true, force: true });
   }
