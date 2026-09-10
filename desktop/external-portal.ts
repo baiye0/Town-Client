@@ -11,7 +11,7 @@ export class ExternalPortalObserver {
   constructor(private run: Command = command, private platform = process.platform) {}
   // Upgrade ownership is explicit: same OS user, live binary and exact Being
   // credential, plus the original launch configuration. Stop through its CLI.
-  async forUpgrade(connection: Connection, label: string, excludeRoot?: string): Promise<Service[]> {
+  async forUpgrade(connection: Connection, label: string, excludeRoot?: string, attempt = 0): Promise<Service[]> {
     let processes: { pid: number; binary: string }[];
     if (this.platform === 'darwin') {
       const listing = await this.run('/bin/ps', ['-axo', 'pid=,uid=,comm=']);
@@ -29,6 +29,7 @@ export class ExternalPortalObserver {
       processes = Array.isArray(data) ? data : [data];
     } else return [];
     const found: Service[] = [];
+    let changing = false;
     for (const process of processes) {
       let root: string, binary: string, launch: { arguments: string[]; cwd: string; environment: Record<string, string> };
       try {
@@ -52,11 +53,21 @@ export class ExternalPortalObserver {
       const configPath = path.resolve(launch.cwd, config);
       await access(configPath);
       const status = JSON.parse(await portableCommand(binary, 'status', this.platform, this.run));
-      if (this.platform === 'darwin' ? !status.portal_pids?.includes(process.pid) : Number(status.pid) !== process.pid) throw new Error('Portal 在准备升级时发生变化，请重试。');
+      if (this.platform === 'darwin' ? !status.portal_pids?.includes(process.pid) : Number(status.pid) !== process.pid) {
+        // Windows start/status helpers use the same executable as the engine.
+        // Only the status-verified engine owns the launch; rescan if the initial
+        // process snapshot caught bootstrap before its supervised child existed.
+        changing = true; continue;
+      }
       const environment = Object.fromEntries(Object.entries(launch.environment).filter(([key, value]) =>
         !key.startsWith('HEART_PORTAL_') && key !== 'PORTAL_CONNECT_LINK' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0')));
       found.push({ label, root, binary, file: '', existing: true, kind: 'portable', login: Boolean(status.launchagent_loaded),
         configPath, cwd: launch.cwd, name: argument('--name') || (await readFile(path.join(root, '.portal-name'), 'utf8')).trim(), environment });
+    }
+    if (changing && !found.length) {
+      if (attempt >= 3) throw new Error('Portal 仍在启动或重启，未停止服务，请稍后重试升级。');
+      await new Promise(resolve => setTimeout(resolve, 500));
+      return this.forUpgrade(connection, label, excludeRoot, attempt + 1);
     }
     return found;
   }

@@ -57,7 +57,9 @@ $ErrorActionPreference='Stop'
 Wait-Process -Id ${parentPid} -Timeout 120 -ErrorAction SilentlyContinue
 if (Get-Process -Id ${parentPid} -ErrorAction SilentlyContinue) { exit 1 }
 try {
-  $result=Start-Process -FilePath ${ps(setup)} -ArgumentList '--silent' -Wait -PassThru
+  $result=Start-Process -FilePath ${ps(setup)} -ArgumentList '--silent' -PassThru
+  # Wait for Setup itself, not any newly launched long-lived client descendants.
+  $result.WaitForExit()
   if ($result.ExitCode -ne 0) { throw 'Client installation failed' }
   $updater=Join-Path $env:LOCALAPPDATA 'beings/Update.exe'
   if (!(Test-Path -LiteralPath $updater)) { throw 'Installed client missing' }

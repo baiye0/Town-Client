@@ -337,7 +337,10 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login
     }
     if (this.platform === 'darwin') {
       await this.run('/bin/launchctl', ['disable', `${this.domain}/${service.label}`]);
-      const loaded = await this.run('/bin/launchctl', ['print', `${this.domain}/${service.label}`]).then(() => true, () => false);
+      const registration = await this.run('/bin/launchctl', ['print', `${this.domain}/${service.label}`]).catch(() => '');
+      const loaded = Boolean(registration);
+      const pid = registration.match(/\bpid = (\d+)/)?.[1];
+      const identity = pid ? await this.run('/bin/ps', ['-p', pid, '-o', 'lstart=,comm=']).then(s => s.trim(), () => '') : '';
       if (loaded) {
         await this.run('/bin/launchctl', ['bootout', `${this.domain}/${service.label}`]);
         for (let attempt = 0; ; attempt++) {
@@ -347,7 +350,16 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login
           await new Promise(resolve => setTimeout(resolve, 250));
         }
       }
-    } else await this.powershell(`Disable-ScheduledTask -TaskName ${ps(service.label)} | Out-Null; Stop-ScheduledTask -TaskName ${ps(service.label)};
+      // A removed launchd registration is not proof that its engine exited.
+      // Wait for that exact process identity before replacing or starting it.
+      if (pid && identity) for (let attempt = 0; ; attempt++) {
+        const current = await this.run('/bin/ps', ['-p', pid, '-o', 'lstart=,comm=']).then(s => s.trim(), () => '');
+        if (current !== identity) break;
+        if (attempt >= 120) throw new Error('旧 Portal 进程尚未退出，已中止安装。');
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    } else await this.powershell(`$task=Get-ScheduledTask -TaskName ${ps(service.label)} -ErrorAction SilentlyContinue;
+if ($task) { Disable-ScheduledTask -TaskName ${ps(service.label)} | Out-Null; Stop-ScheduledTask -TaskName ${ps(service.label)}; }
 $pidFile=${ps(path.join(service.root, 'pid'))};
 if (Test-Path -LiteralPath $pidFile) {
   $portalId=0; if ([int]::TryParse((Get-Content -LiteralPath $pidFile -Raw).Trim(), [ref]$portalId)) {
@@ -359,6 +371,11 @@ if (Test-Path -LiteralPath $pidFile) {
       if (Get-Process -Id $portalId -ErrorAction SilentlyContinue) { throw 'Portal is still running' }
     }
   }
+}
+$deadline=[DateTime]::UtcNow.AddSeconds(15);
+while (($task=Get-ScheduledTask -TaskName ${ps(service.label)} -ErrorAction SilentlyContinue) -and $task.State -eq 'Running') {
+  if ([DateTime]::UtcNow -ge $deadline) { throw 'Portal supervisor task is still running' }
+  Start-Sleep -Milliseconds 200;
 }`);
   }
   get installedService(): Service | null { return this.service; }
