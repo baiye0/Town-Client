@@ -28,12 +28,25 @@ for (const [artifact, platform, arch, label] of [
   const bundle = JSON.parse(await readFile(metadata, 'utf8'));
   if (bundle.schema !== 1 || bundle.clientVersion !== version || bundle.platform !== platform || bundle.arch !== arch) throw new Error(`Mismatched ${label} manifest`);
   const zip = exactlyOne(contents.filter(f => f.endsWith('.zip')), 'platform ZIP');
-  const entries = execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' }).split('\n');
-  const embedded = exactlyOne(entries.filter(f => /(?:^|\/)[Rr]esources\/runtime-bundle\.json$/.test(f)), 'packaged runtime manifest');
-  if (!execFileSync('unzip', ['-p', zip, embedded]).equals(await readFile(metadata))) throw new Error(`${label} packaged manifest mismatch`);
-  const binary = exactlyOne(entries.filter(f => platform === 'darwin'
-    ? f.endsWith('.app/Contents/Resources/heart-portal') : /(?:^|\/)resources\/heart-portal\.exe$/.test(f)), 'bundled engine');
-  if (sha(execFileSync('unzip', ['-p', zip, binary], { maxBuffer: 256 * 1024 * 1024 })) !== bundle.sha256) throw new Error(`${label} engine checksum mismatch`);
+  // .NET's Windows ZIP writer can use backslashes. Match normalized names,
+  // but read the original entry literally without extracting archive paths.
+  const archive = JSON.parse(execFileSync('python3', ['-c', String.raw`
+import hashlib, json, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    names = [(name, name.replace('\\', '/')) for name in z.namelist()]
+    def one(suffix):
+        found = [raw for raw, normalized in names if normalized.lower().endswith(suffix.lower())]
+        if len(found) != 1: raise ValueError('Expected exactly one entry ending in ' + suffix + ', found ' + str(len(found)))
+        return found[0]
+    manifest = z.read(one('resources/runtime-bundle.json'))
+    binary = one('resources/heart-portal' + ('.exe' if sys.argv[2] == 'win32' else ''))
+    digest = hashlib.sha256()
+    with z.open(binary) as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''): digest.update(chunk)
+    print(json.dumps({'manifest': hashlib.sha256(manifest).hexdigest(), 'binary': digest.hexdigest()}))
+`, zip, platform], { encoding: 'utf8' }));
+  if (archive.manifest !== sha(await readFile(metadata))) throw new Error(`${label} packaged manifest mismatch`);
+  if (archive.binary !== bundle.sha256) throw new Error(`${label} engine checksum mismatch`);
   await copyFile(zip, path.join(output, `Town-Client-${version}-${label}.zip`));
   await copyFile(metadata, path.join(output, `runtime-bundle-${label}.json`));
   if (platform === 'win32') {
