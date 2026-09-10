@@ -52,7 +52,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -70,6 +69,7 @@ jobs:
       - name: Validate both packages and stage checksums
         run: node scripts/stage-release.mjs artifacts release "${GITHUB_REF_NAME#v}"
       - name: Publish the complete paired release
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

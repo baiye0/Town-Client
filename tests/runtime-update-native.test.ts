@@ -56,4 +56,5 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
     }
     await rm(root, { recursive: true, force: true });
   }
-}, 70_000);
+// Includes a deliberate 25 s startup failure plus real OS stop/start commands.
+}, 120_000);
