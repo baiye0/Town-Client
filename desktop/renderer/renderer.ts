@@ -108,6 +108,8 @@ function applySnapshot(next: Snapshot, reload = false) {
   snapshot = next;
   workspace.snapshot(next);
   const settings = next.settings;
+  $('startup-notice').textContent = next.notice || '';
+  $('startup-notice').hidden = !next.notice;
   document.querySelectorAll<HTMLButtonElement>('[data-chat-action], #toggle-chat-search').forEach(button => { button.disabled = !settings.hasToken; });
   $('background-status').textContent = next.portal.managed === false ? `当前运行目录：${next.portal.runtimePath}。客户端仅观察；自启与守护状态以原管理方式为准。` : next.background?.enabled ? `${next.background.message}。点击“停止”会同时停用登录自启。` : next.background?.message || '后台服务未启用；临时启动的 Portal 随客户端退出。';
   $('conversation-name').textContent = settings.being || 'Being';
@@ -214,8 +216,23 @@ if (!api) toast('请通过 Beings 桌面客户端打开此页面。');
 else {
   document.documentElement.dataset.platform = api.platform;
   api.onPortal(state => { renderPortal(state); void action(async () => applySnapshot(await api.snapshot())); });
-  void action(async () => {
-    applyTheme(await api.appearance()); applySnapshot(await api.snapshot());
-    document.body.dataset.view = 'chat';
-  });
+  const initialize = async () => {
+    $('startup-retry').hidden = true;
+    $('startup-spinner').hidden = false;
+    $('startup-screen').setAttribute('aria-busy', 'true');
+    $('startup-message').textContent = '正在加载配置并恢复连接…';
+    try {
+      const [appearance, state] = await Promise.all([api.appearance(), api.snapshot()]);
+      applyTheme(appearance); applySnapshot(state);
+      document.body.dataset.view = 'chat';
+      $('client-main').hidden = false;
+      $('startup-screen').hidden = true;
+    } catch {
+      $('startup-message').textContent = '配置加载未完成，请重试。原配置不会被覆盖。';
+      $('startup-spinner').hidden = true;
+      $('startup-retry').hidden = false;
+    } finally { $('startup-screen').setAttribute('aria-busy', 'false'); }
+  };
+  $('startup-retry').addEventListener('click', () => { void initialize(); });
+  void initialize();
 }

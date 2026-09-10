@@ -60,3 +60,13 @@ input[type=checkbox]{appearance:none;width:30px;height:18px;border-radius:10px;b
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
 @media(max-width:1040px){.portal-content{padding:32px 26px}.capabilities{gap:10px}.topbar{padding:0 20px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+
+.startup-screen{position:fixed;inset:0;display:grid;place-items:center;background:var(--bg);-webkit-app-region:drag}
+.startup-content{display:flex;flex-direction:column;align-items:center;gap:20px;padding:32px;text-align:center;color:var(--secondary)}
+.startup-content img{object-fit:contain;border-radius:12px}
+.startup-content p{margin:0;font-size:13px;letter-spacing:.02em}
+.startup-content button{-webkit-app-region:no-drag}
+.startup-spinner{width:18px;height:18px;border:2px solid var(--line);border-top-color:var(--secondary);border-radius:50%;animation:startup-spin .9s linear infinite}
+.startup-notice{margin:0;padding:10px 24px;background:var(--surface);color:var(--secondary);font-size:12px;border-bottom:1px solid var(--line)}
+@keyframes startup-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.startup-spinner{animation:none}}

@@ -13,6 +13,7 @@ import { installerEvent, handleInstallerEvent } from './installer-events';
 import { BackgroundPortal } from './background';
 import { KitInstaller } from './kit-install';
 import { ChatProxy } from './proxy';
+import { verifyBeingConnection } from './being-ready';
 import type { SaveSettings, TownPost, TownQuery, KitInstallInput } from './shared';
 import { TownLive } from './town-live';
 import { TownClient, TownCredentials, TOWN_ORIGIN } from './town';
@@ -89,7 +90,9 @@ async function ready() {
     encryptString: (value: string) => safeStorage.encryptString(value), decryptString: (value: Buffer) => safeStorage.decryptString(value),
   };
   store = new SettingsStore(directory, secretStorage, binary);
-  await store.load();
+  let startupNotice: string | undefined;
+  try { await store.load(); }
+  catch { startupNotice = '原连接配置未能读取，Portal 未启动。配置文件已保留，请检查系统密钥库或连接设置。'; }
   const townCredentials = new TownCredentials(directory, secretStorage);
   let townWarning: string | undefined;
   try { await townCredentials.load(); } catch (error) { townWarning = (error as Error).message; }
@@ -124,6 +127,7 @@ async function ready() {
   let recoveryBlocked = false;
   const clientInstall = new ClientInstall(directory, background);
   const installIntent = await clientInstall.read();
+  let startupDeferred = false;
   // Only the trusted top-level local shell can control local capabilities.
   const handle = (channel: string, callback: (...args: any[]) => unknown) => {
     ipcMain.handle(channel, (event, ...args) => {
@@ -176,7 +180,11 @@ async function ready() {
   };
   handle('beings:check-updates', showUpdates);
   handle('beings:update-state', () => updates.state);
-  const snapshot = () => ({ settings: store.settings, portal: portal.state, background: background.state });
+  const snapshot = () => ({ settings: store.settings, portal: portal.state, background: background.state, notice: startupNotice });
+  const verifyConnection = async () => {
+    await verifyBeingConnection(store.connection, net.fetch.bind(net) as typeof fetch);
+    startupNotice = undefined;
+  };
   const externalPortal = new ExternalPortalObserver();
   const observeExternal = async () => {
     const state = await externalPortal.read(store.connection);
@@ -189,7 +197,8 @@ async function ready() {
     portal.state = state;
     portal.emit('state', portal.state);
   };
-  handle('beings:snapshot', snapshot);
+  // Initial reads wait for configuration validation and upgrade recovery.
+  handle('beings:snapshot', () => exclusive(async () => snapshot()));
   handle('beings:appearance', (theme?: 'light' | 'dark') => exclusive(async () => {
     if (theme === undefined) return appearance;
     if (theme !== 'light' && theme !== 'dark') throw new Error('无效的配色。');
@@ -240,6 +249,7 @@ async function ready() {
   handle('beings:kit-discard', (ticket: string) => exclusive(() => kitInstaller.discard(ticket)));
   handle('beings:kits-apply', () => exclusive(async () => {
     if (!store.connection) throw new Error('请先连接 Being。');
+    await verifyConnection();
     if (portal.state.managed === false) throw new Error('当前连接的是独立 Portal，请使用原管理方式重启应用 Kits。');
     if (background.state.enabled) { await background.restart(); await publishBackground(); }
     else {
@@ -273,6 +283,7 @@ async function ready() {
     await store.save(input);
     try {
       if (store.settings.backgroundEnabled) {
+        await verifyConnection();
         await portal.stop();
         await background.enable(store.settings, store.connection!);
         await publishBackground();
@@ -291,8 +302,13 @@ async function ready() {
     return result.canceled ? null : result.filePaths[0];
   });
   handle('beings:portal-start', () => exclusive(async () => {
+    if (startupDeferred) {
+      await restoreStartup();
+      if (startupDeferred) throw new Error(startupNotice);
+    }
     if (!portal.managing && await observeExternal()) return portal.state;
     if (!store.connection) throw new Error('请先连接 Being。');
+    await verifyConnection();
     if (store.settings.backgroundEnabled) {
       await background.enable(store.settings, store.connection); await publishBackground(); return portal.state;
     }
@@ -317,9 +333,17 @@ async function ready() {
     { role: 'editMenu' }, { label: '视图', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     { role: 'windowMenu' }, { label: '帮助', submenu: [{ label: '检查更新…', click: () => { void showUpdates(); } }] },
   ]));
-  createWindow();
-  await exclusive(async () => {
-    if (!store.connection) { if (installIntent) await clientInstall.finish(); return; }
+  async function restoreStartup() {
+    if (!store.connection) return;
+    try { await verifyConnection(); startupDeferred = false; }
+    catch (error) {
+      startupDeferred = true;
+      startupNotice = (error as Error).message;
+      runtimeUpdate = { phase: 'skipped', message: startupNotice };
+      portal.state = { phase: 'stopped', message: startupNotice, logs: [] };
+      // Keep pending upgrade records: reconnect/restart can finish safely.
+      return;
+    }
     try {
       if (installIntent && app.getVersion() === installIntent.from) {
         await clientInstall.resume(installIntent);
@@ -375,7 +399,9 @@ async function ready() {
       portal.emit('state', portal.state);
       if (!quitting && window) void dialog.showMessageBox(window, { type: 'warning', title: 'Portal 更新未完成', message: runtimeUpdate.message, buttons: ['知道了'] });
     }
-  });
+  }
+  createWindow();
+  await exclusive(restoreStartup);
   if (app.isPackaged && !process.env.BEINGS_USER_DATA) {
     void updates.check();
     updatePoll = setInterval(() => { void updates.check(); }, 6 * 60 * 60 * 1000);
