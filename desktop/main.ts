@@ -48,6 +48,7 @@ function createWindow() {
   const acrylic = process.platform === 'win32' && Number(os.release().split('.')[2]) >= 22621;
   window = new BrowserWindow({
     width: 1280, height: 860, minWidth: 920, minHeight: 640, title: 'Beings',
+    icon: path.join(app.isPackaged ? process.resourcesPath : app.getAppPath(), app.isPackaged ? 'branding/app.png' : 'resources/branding/app.png'),
     backgroundColor: process.platform === 'darwin' || acrylic ? '#00000000' : nativeTheme.shouldUseDarkColors ? '#212121' : '#ffffff',
     ...(process.platform === 'darwin' ? { vibrancy: 'sidebar' as const, visualEffectState: 'active' as const } : {}),
     ...(acrylic ? { backgroundMaterial: 'acrylic' as const } : {}),

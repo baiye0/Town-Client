@@ -11,14 +11,15 @@ const config: ForgeConfig = {
     asar: true,
     executableName: 'beings',
     appBundleId: 'town.beings.desktop',
-    extraResource: [binary, path.resolve('resources/HEART-PORTAL-LICENSE')],
+    icon: path.resolve('resources/branding/app'),
+    extraResource: [binary, path.resolve('resources/HEART-PORTAL-LICENSE'), path.resolve('resources/branding')],
   },
   hooks: {
     prePackage: async () => {
       if (!existsSync(binary)) throw new Error('Portal binary missing. Run npm run build:portal first.');
     },
   },
-  makers: [new MakerZIP({}, ['darwin', 'linux', 'win32']), new MakerSquirrel({ name: 'beings' })],
+  makers: [new MakerZIP({}, ['darwin', 'linux', 'win32']), new MakerSquirrel({ name: 'beings', setupIcon: path.resolve('resources/branding/app.ico') })],
   plugins: [new VitePlugin({
     build: [
       { entry: 'desktop/main.ts', config: 'vite.main.config.ts', target: 'main' },

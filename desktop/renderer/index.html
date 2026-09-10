@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* ws://127.0.0.1:*; frame-src beings://chat; img-src 'self' data:; base-uri 'none'; form-action 'none'">
   <title>Beings</title>
+  <link rel="icon" type="image/png" href="../../resources/branding/app.png">
 </head>
 <body>
   <main>
@@ -29,7 +30,7 @@
     <div class="scene-ribbon"><div class="scene-place"><span class="scene-orbit" aria-hidden="true">◉</span><div><span id="scene-caption" class="scene-caption">此刻，你在这里</span><h1 id="scene-location">与你的 Being 交谈</h1></div></div><div class="scene-ribbon-end"><span id="scene-invitation">选中一段内容，邀请 Being 一起看</span><button id="toggle-companion" aria-controls="companion-panel" aria-expanded="false" hidden>继续这个话题 <span aria-hidden="true">↗</span></button></div></div>
     <section id="chat-view" class="view">
       <div id="welcome">
-        <div class="welcome-intro"><span class="welcome-logo">b<span>·</span></span><h1>从一个想法开始</h1><p>连接你的 Being，继续对话。</p></div>
+        <div class="welcome-intro"><img class="welcome-logo" src="../../resources/branding/logo.png" alt="Town-Client" width="88" height="88"><h1>从一个想法开始</h1><p>连接你的 Being，继续对话。</p></div>
         <button class="welcome-connect" id="connect-button"><span>连接我的 Being</span><span class="welcome-connect-arrow" aria-hidden="true">↗</span></button>
       </div>
       <iframe id="chat-frame" title="Being 对话" hidden sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads"></iframe>
