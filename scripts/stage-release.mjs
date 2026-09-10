@@ -29,6 +29,8 @@ for (const [artifact, platform, arch, label] of [
   if (bundle.schema !== 1 || bundle.clientVersion !== version || bundle.platform !== platform || bundle.arch !== arch) throw new Error(`Mismatched ${label} manifest`);
   const zip = exactlyOne(contents.filter(f => f.endsWith('.zip')), 'platform ZIP');
   const entries = execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' }).split('\n');
+  const embedded = exactlyOne(entries.filter(f => /(?:^|\/)[Rr]esources\/runtime-bundle\.json$/.test(f)), 'packaged runtime manifest');
+  if (!execFileSync('unzip', ['-p', zip, embedded]).equals(await readFile(metadata))) throw new Error(`${label} packaged manifest mismatch`);
   const binary = exactlyOne(entries.filter(f => platform === 'darwin'
     ? f.endsWith('.app/Contents/Resources/heart-portal') : /(?:^|\/)resources\/heart-portal\.exe$/.test(f)), 'bundled engine');
   if (sha(execFileSync('unzip', ['-p', zip, binary], { maxBuffer: 256 * 1024 * 1024 })) !== bundle.sha256) throw new Error(`${label} engine checksum mismatch`);
