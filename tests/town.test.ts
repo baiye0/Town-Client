@@ -16,7 +16,7 @@ describe('Town reads', () => {
     const client = new TownClient(() => 'town-credential', fetcher as typeof fetch);
     await client.query({ kind: 'home' }); await client.query({ kind: 'inbox' });
     expect(fetcher.mock.calls[0]).toEqual(['https://beings.town/api', expect.objectContaining({ headers: { Accept: 'application/json' }, credentials: 'omit', redirect: 'error', method: 'GET' })]);
-    expect(fetcher.mock.calls[1]).toEqual(['https://beings.town/api/messages?with=received&token=town-credential', expect.objectContaining({ headers: { Accept: 'application/json', Authorization: 'Bearer town-credential' } })]);
+    expect(fetcher.mock.calls[1]).toEqual(['https://beings.town/api/messages?with=received', expect.objectContaining({ headers: { Accept: 'application/json', Authorization: 'Bearer town-credential' } })]);
   });
   it('distinguishes authorization failure, offline, invalid HTML and upstream error', async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(new Response('secret error text', { status: 401 })).mockRejectedValueOnce(new Error('URL with secret')).mockResolvedValueOnce(new Response('<html>loom</html>', { headers: { 'content-type': 'text/html' } })).mockResolvedValueOnce(new Response('', { status: 503 }));

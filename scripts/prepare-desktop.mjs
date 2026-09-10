@@ -1,3 +1,4 @@
+import { writeRuntimeBundle } from './runtime-bundle.mjs';
 import { mkdir, readFile, writeFile, copyFile, access, chmod } from 'node:fs/promises';
 import path from 'node:path';
 import { build } from 'esbuild';
@@ -63,4 +64,5 @@ catch {
   try { await copyFile(source, destination); if (process.platform !== 'win32') await chmod(destination, 0o755); }
   catch { console.log('Portal binary not found. Chat is available; run npm run build:portal to bundle the local engine.'); }
 }
+try { await access(destination); await writeRuntimeBundle(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 console.log('Prepared local Loom assets (no CDN requests).');

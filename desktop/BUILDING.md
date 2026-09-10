@@ -78,9 +78,9 @@ macOS 可将解压后的 `Beings.app` 放到 Applications 或稳定的用户目�
 
 ### Windows 安装包的明确边界
 
-当前 Squirrel Maker 能描述 Setup 构建目标，但客户端尚未专门处理 Squirrel 安装/更新/卸载事件和快捷方式创建，且没有完成 Windows 实机验收。Windows 试用应优先验证 ZIP 版本；不能把 macOS 的构建成功或配置文件存在当作 Setup 安装成功。正式分发 Setup 前，需要补齐并验证安装事件、快捷方式、卸载和升级路径。
+客户端已处理 Squirrel 安装、更新和卸载事件，由安装程序创建或移除快捷方式；这些短进程不会启动 Portal。Windows Setup 升级及后台任务仍需实机验收。
 
-当前均为未签名的开发/试用包：未配置 macOS Developer ID、公证、Windows Authenticode、自动更新与图标定制。操作系统可能提示来源未验证；正式公开发布前应配置签名并在目标系统验收。Electron 的下载校验不等于应用代码签名。
+当前均为未签名的开发/试用包：未配置 macOS Developer ID、公证、Windows Authenticode、应用自动下载/替换。操作系统可能提示来源未验证；正式公开发布前应配置签名并在目标系统验收。Electron 的下载校验不等于应用代码签名。
 
 ## 网络与常见失败
 
@@ -118,7 +118,7 @@ npm run make
 
 客户端设置位于 Electron 的用户数据目录（通常 macOS 为 `~/Library/Application Support/Beings`，Windows 为 `%APPDATA%\Beings`，Linux 为 `$XDG_CONFIG_HOME/Beings` 或 `~/.config/Beings`）。`BEINGS_USER_DATA` 会覆盖该目录，仅用于隔离开发/测试 profile。
 
-重启客户端会关闭旧窗口并丢弃未发送的输入，先保存草稿。开启后台常驻的 Portal 位于独立目录，退出或替换客户端不会停止它；客户端重开后附着已有服务。更新客户端内置引擎不会自动替换正在运行的后台引擎。若需要更新引擎，应在客户端停止后台服务，再重新启用；沿用的外部 Portal 配置/二进制需按该服务自身方式更新。
+客户端采用手动安装新版本、首次启动自动同步 Portal 与守护的配套升级方式。先结束本机任务并保存草稿，退出旧客户端并安装新版，再重新打开。配置、Kits、凭据和工作目录保留；停止状态保留，失败恢复旧服务。详细范围、发布和恢复流程见 [UPDATING.md](UPDATING.md)。
 
 卸载前若不再需要本机能力，在「本机 Portal」点击「停止」，确认后台常驻和登录自启已停用，再移除客户端。删除客户端安装目录本身不会卸载后台服务，也不会删除用户配置或 Kit 凭据。由客户端识别并沿用的服务同样需要先停用；不要按进程名批量杀死其他 Portal。
 

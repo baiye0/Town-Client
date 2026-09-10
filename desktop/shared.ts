@@ -30,6 +30,9 @@ export interface BackgroundState { supported: boolean; installed: boolean; enabl
 export interface Snapshot { settings: Settings; portal: PortalState; background?: BackgroundState }
 export interface DesktopAPI {
   platform: string;
+  checkUpdates(): Promise<void>;
+  updateState(): Promise<import('./updates').UpdateState>;
+  onUpdate(callback: (state: import('./updates').UpdateState) => void): () => void;
   appearance(theme?: 'light' | 'dark'): Promise<'light' | 'dark'>;
   town(query: TownQuery): Promise<TownResult>;
   townLive(): Promise<TownLiveState>;

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { access, chmod, copyFile, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, copyFile, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -25,7 +25,7 @@ const sh = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const ps = (value: string) => `'${value.replaceAll("'", "''")}'`;
 const xml = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 16);
-interface Service { label: string; file: string; root: string; existing: boolean; fingerprint?: string }
+export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string }
 export function fingerprint(settings: Settings, connection: Connection) {
   return hash(JSON.stringify([connection.link, settings.portalBinary, settings.portalConfigPath, settings.portalName,
     settings.workspace, settings.portalEnvironmentPath, settings.allowExec, settings.kitsEnabled, "status-v1"]));
@@ -47,6 +47,7 @@ export function windowsRunner(root: string, config: string, settings: Settings):
   // The scheduled task owns this process tree; it has no client/Electron dependency.
   return `$ErrorActionPreference = 'Stop'\n$root = ${ps(root)}\n` +
 `$env:PORTAL_CONNECT_LINK = [System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath (Join-Path $root 'connection.dpapi') -Raw | ConvertTo-SecureString)).Password
+$PID | Set-Content -LiteralPath (Join-Path $root 'supervisor.pid')
 $env:HEART_PORTAL_SUPERVISED = '1'
 $env:RUST_LOG = 'info'
 $env:NO_COLOR = '1'
@@ -85,10 +86,17 @@ while ($true) {
 `;
 }
 export function windowsArgument(value: string) { return '"' + value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1') + '"'; }
-async function atomic(file: string, contents: string) {
+export async function atomic(file: string, contents: string) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = file + '.' + randomUUID();
-  await writeFile(temp, contents, { mode: 0o600 }); await rename(temp, file);
+  const handle = await open(temp, 'wx', 0o600);
+  try { await handle.writeFile(contents); await handle.sync(); }
+  finally { await handle.close(); }
+  await rename(temp, file);
+  if (process.platform !== 'win32') {
+    const parent = await open(path.dirname(file), 'r');
+    try { await parent.sync(); } finally { await parent.close(); }
+  }
 }
 async function tail(file: string) {
   try {
@@ -108,7 +116,7 @@ export class BackgroundPortal {
     this.state = { supported: ['darwin', 'win32'].includes(platform), installed: false, enabled: false, running: false, existing: false,
       message: ['darwin', 'win32'].includes(platform) ? '未启用后台服务' : '此版本的后台服务支持 macOS 和 Windows' };
   }
-  private get domain() { return `gui/${process.getuid!()}`; }
+  private get domain() { return `gui/${process.getuid?.() ?? 0}`; }
   private powershell(script: string, input?: string) {
     return this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from("$ErrorActionPreference='Stop'; " + script, 'utf16le').toString('base64')], input);
   }
@@ -116,7 +124,7 @@ export class BackgroundPortal {
     this.connection = connection;
     try { this.service = JSON.parse(await readFile(path.join(this.directory, 'portal-service.json'), 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    if (this.service && this.platform === 'darwin') {
+    if (this.service && this.platform === 'darwin' && this.service.kind !== 'portable') {
       try { await access(this.service.file); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') this.service = null; else throw error; }
     }
@@ -138,13 +146,36 @@ export class BackgroundPortal {
         } catch { /* Unrelated or unreadable services are never modified. */ }
       }
     }
+    if (!this.service && connection && settings.portalConfigPath && ['darwin', 'win32'].includes(this.platform)) {
+      const root = path.dirname(settings.portalConfigPath);
+      try {
+        const resolved = await realpath(settings.portalBinary);
+        const expectedRoot = path.basename(path.dirname(resolved)) === 'release' && path.basename(path.dirname(path.dirname(resolved))) === 'target'
+          ? path.dirname(path.dirname(path.dirname(resolved))) : path.dirname(resolved);
+        if (expectedRoot !== await realpath(root)) return this.refresh();
+        const savedLink = parseConnection(await readFile(path.join(root, '.portal-connection.url'), 'utf8'));
+        const savedName = (await readFile(path.join(root, '.portal-name'), 'utf8')).trim();
+        if (savedLink.link === connection.link && savedName === settings.portalName) {
+          const status = JSON.parse(await this.run(settings.portalBinary, ['status']));
+          if (this.platform === 'darwin' && status.supervisor?.kind === 'inherited-session' && !status.launchagent_loaded && Array.isArray(status.portal_pids) && status.portal_pids.length === 1) {
+            this.service = { label: this.label, root, file: '', existing: true, kind: 'portable', login: false,
+              binary: settings.portalBinary, configPath: settings.portalConfigPath, cwd: settings.workspace,
+              name: settings.portalName, environmentPath: settings.portalEnvironmentPath, fingerprint: fingerprint(settings, connection) };
+          }
+        }
+      } catch { /* Unknown supervision cannot be safely replaced. */ }
+    }
     return this.refresh();
   }
   async refresh(): Promise<BackgroundState> {
     const service = this.service;
     if (!service) return this.state;
     let enabled = false, running = false, loaded = true, pid: number | undefined;
-    if (this.platform === 'darwin') {
+    if (service.kind === 'portable') {
+      const status = JSON.parse(await this.run(service.binary!, ['status']));
+      running = Array.isArray(status.portal_pids) && status.portal_pids.length === 1 && Boolean(status.supervisor);
+      enabled = running; pid = running ? status.portal_pids[0] : undefined;
+    } else if (this.platform === 'darwin') {
       await access(service.file); // Missing registration must not be presented as healthy.
       const disabled = await this.run('/bin/launchctl', ['print-disabled', this.domain]);
       const entry = disabled.split('\n').find(line => line.includes(`"${service.label}"`));
@@ -208,6 +239,7 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
       const binary = path.join(root, this.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
       await copyFile(settings.portalBinary, binary); await chmod(binary, 0o700);
       const config = settings.portalConfigPath || path.join(root, 'portal.toml');
+      service.configPath = config; service.cwd = settings.workspace;
       if (!settings.portalConfigPath) await atomic(config, portalConfig(settings));
       if (this.platform === 'darwin') {
         await atomic(path.join(root, 'connection.url'), connection.link);
@@ -227,7 +259,7 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
       await this.refresh();
       // Persist ownership only after registration succeeds. Stable runtime survives app moves/updates.
       await atomic(path.join(this.directory, 'portal-service.json'), JSON.stringify(service));
-      if (previous && !previous.existing) await rm(previous.root, { recursive: true, force: true }).catch(() => {});
+      // Keep the previous runtime: it may still own the original configuration.
       return this.state;
     } catch (error) {
       if (registrationChanged) {
@@ -245,16 +277,26 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
       throw error;
     }
   }
-  private async registerWindows(service: Service) {
+  async registerWindows(service: Service) {
     const args = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + windowsArgument(path.join(service.root, 'run.ps1'));
     await this.powershell(`$user=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;
 $a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${ps(args)};
-$t=New-ScheduledTaskTrigger -AtLogOn -User $user;
+${service.login === false ? '' : '$t=New-ScheduledTaskTrigger -AtLogOn -User $user;'}
 $p=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited;
 $s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable;
-Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null`);
+Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login === false ? '' : '-Trigger $t'} -Principal $p -Settings $s -Force | Out-Null`);
   }
-  private async load(service: Service) {
+  async load(service: Service) {
+    if (service.kind === 'portable') {
+      if (!this.connection) throw new Error('恢复原 Portal 缺少连接配置。');
+      const child = spawn(service.binary!, ['--config', service.configPath!, '--name', service.name!], {
+        cwd: service.cwd, detached: true, stdio: 'ignore', windowsHide: true,
+        env: { ...process.env, ...(service.environmentPath ? { PATH: service.environmentPath } : {}), PORTAL_CONNECT_LINK: this.connection.link, HEART_PORTAL_SUPERVISED: undefined },
+      });
+      await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+      child.unref();
+      return;
+    }
     if (this.platform === 'darwin') {
       await this.run('/bin/launchctl', ['enable', `${this.domain}/${service.label}`]);
       const loaded = await this.run('/bin/launchctl', ['print', `${this.domain}/${service.label}`]).then(() => true, () => false);
@@ -270,19 +312,55 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a -Trigger $t -Pr
       }
     } else await this.powershell(`Enable-ScheduledTask -TaskName ${ps(service.label)} | Out-Null; Start-ScheduledTask -TaskName ${ps(service.label)}`);
   }
-  private async unload(service: Service) {
+  async unload(service: Service) {
+    if (service.kind === 'portable') {
+      await this.run(service.binary!, ['stop']);
+      const status = JSON.parse(await this.run(service.binary!, ['status']));
+      if (status.supervisor || status.portal_pids?.length) throw new Error('原 Portal 或守护程序尚未退出。');
+      return;
+    }
     if (this.platform === 'darwin') {
       await this.run('/bin/launchctl', ['disable', `${this.domain}/${service.label}`]);
       const loaded = await this.run('/bin/launchctl', ['print', `${this.domain}/${service.label}`]).then(() => true, () => false);
-      if (loaded) await this.run('/bin/launchctl', ['bootout', `${this.domain}/${service.label}`]);
+      if (loaded) {
+        await this.run('/bin/launchctl', ['bootout', `${this.domain}/${service.label}`]);
+        for (let attempt = 0; ; attempt++) {
+          const present = await this.run('/bin/launchctl', ['print', `${this.domain}/${service.label}`]).then(() => true, () => false);
+          if (!present) break;
+          if (attempt >= 60) throw new Error('旧 Portal 服务尚未退出，已中止切换。');
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+      }
     } else await this.powershell(`Disable-ScheduledTask -TaskName ${ps(service.label)} | Out-Null; Stop-ScheduledTask -TaskName ${ps(service.label)};
 $pidFile=${ps(path.join(service.root, 'pid'))};
 if (Test-Path -LiteralPath $pidFile) {
   $portalId=0; if ([int]::TryParse((Get-Content -LiteralPath $pidFile -Raw).Trim(), [ref]$portalId)) {
     $p=Get-CimInstance Win32_Process -Filter "ProcessId = $portalId";
-    if ($p -and $p.ExecutablePath -eq ${ps(path.join(service.root, 'heart-portal.exe'))}) { & taskkill.exe /PID $portalId /T /F | Out-Null }
+    if ($p -and $p.ExecutablePath -eq ${ps(path.join(service.root, 'heart-portal.exe'))}) {
+      & taskkill.exe /PID $portalId /T /F | Out-Null;
+      if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $portalId -ErrorAction SilentlyContinue)) { throw 'Portal process tree did not stop' }
+      Wait-Process -Id $portalId -Timeout 15 -ErrorAction SilentlyContinue;
+      if (Get-Process -Id $portalId -ErrorAction SilentlyContinue) { throw 'Portal is still running' }
+    }
   }
 }`);
+  }
+  get installedService(): Service | null { return this.service; }
+  async setService(service: Service) {
+    await atomic(path.join(this.directory, 'portal-service.json'), JSON.stringify(service));
+    this.service = service;
+    return this.refresh();
+  }
+  async installRegistration(service: Service) {
+    if (this.platform === 'darwin') await atomic(service.file, launchAgent(service.label, service.root));
+    else await this.registerWindows(service);
+  }
+  async protectCredential(root: string, connection: Connection) {
+    if (this.platform === 'darwin') await atomic(path.join(root, 'connection.url'), connection.link);
+    else {
+      const encrypted = await this.powershell(`[Console]::In.ReadToEnd() | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString`, connection.link);
+      await atomic(path.join(root, 'connection.dpapi'), encrypted.trim());
+    }
   }
   async disable() { if (this.service) await this.unload(this.service); return this.refresh(); }
   async restart() {

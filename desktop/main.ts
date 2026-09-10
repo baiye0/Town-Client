@@ -1,10 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, net, nativeTheme, protocol, safeStorage, session, shell, Menu } from 'electron';
 import path from 'node:path';
 import os from 'node:os';
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { SettingsStore } from './settings';
 import { PortalSupervisor } from './portal';
 import { ExternalPortalObserver } from './external-portal';
+import { RuntimeUpdater, loadRuntimeBundle, type RuntimeUpdateResult } from './runtime-update';
+import { UpdateChecker } from './updates';
+import { installerEvent, handleInstallerEvent } from './installer-events';
 import { BackgroundPortal } from './background';
 import { KitInstaller } from './kit-install';
 import { ChatProxy } from './proxy';
@@ -15,6 +18,7 @@ import { localKits, kitLocation, readKit, importLocalKit } from './kits';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
+declare const TOWN_UPDATE_REPOSITORY: string;
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'beings', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
 if (process.env.BEINGS_USER_DATA) app.setPath('userData', path.resolve(process.env.BEINGS_USER_DATA));
@@ -26,6 +30,7 @@ let store: SettingsStore;
 let background: BackgroundPortal;
 let kitInstaller: KitInstaller;
 let townLive: TownLive;
+let updatePoll: ReturnType<typeof setInterval> | undefined;
 let backgroundPoll: ReturnType<typeof setInterval> | undefined;
 let quitting = false;
 let mutation = Promise.resolve();
@@ -114,14 +119,34 @@ async function ready() {
   });
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
+  let recoveryBlocked = false;
   // Only the trusted top-level local shell can control local capabilities.
   const handle = (channel: string, callback: (...args: any[]) => unknown) => {
     ipcMain.handle(channel, (event, ...args) => {
       const frame = event.senderFrame;
       if (!window || event.sender !== window.webContents || frame !== window.webContents.mainFrame || frame.url !== shellURL()) throw new Error('Untrusted IPC sender');
+      if (recoveryBlocked && ['beings:save', 'beings:portal-start', 'beings:portal-stop', 'beings:kits-apply'].includes(channel)) throw new Error('Portal 升级恢复尚未完成，请重新启动客户端完成恢复。');
       return callback(...args);
     });
   };
+  let runtimeUpdate: RuntimeUpdateResult = { phase: 'current', message: 'Portal 升级状态将在启动检查后显示。' };
+  const updates = new UpdateChecker(app.getVersion(), TOWN_UPDATE_REPOSITORY, net.fetch.bind(net) as typeof fetch,
+    state => { if (window && !window.isDestroyed()) window.webContents.send('beings:update-state', state); });
+  let showingUpdates = false;
+  const showUpdates = async () => {
+    if (showingUpdates || !window) return;
+    showingUpdates = true;
+    try {
+      const state = await updates.check();
+      const answer = await dialog.showMessageBox(window, { type: state.phase === 'available' ? 'info' : 'none', title: '客户端更新',
+        message: state.phase === 'available' ? `发现 Town-Client ${state.latestVersion}` : state.message,
+        detail: `当前客户端：${app.getVersion()}${runtimeUpdate.portalVersion ? ` · Portal：${runtimeUpdate.portalVersion}` : ''}\n${runtimeUpdate.message}\n\n更新方式：保存草稿，退出客户端，安装新版后重新打开。首次启动会停止匹配的旧守护和 Portal，同步安装包中的引擎与守护程序，沿用配置并恢复原运行状态。执行中的本机任务会中断，请先结束任务。`,
+        buttons: ['关闭', '打开发布页'], defaultId: 0, cancelId: 0 });
+      if (answer.response === 1) await shell.openExternal(state.releaseUrl);
+    } finally { showingUpdates = false; }
+  };
+  handle('beings:check-updates', showUpdates);
+  handle('beings:update-state', () => updates.state);
   const snapshot = () => ({ settings: store.settings, portal: portal.state, background: background.state });
   const externalPortal = new ExternalPortalObserver();
   const observeExternal = async () => {
@@ -261,18 +286,55 @@ async function ready() {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const }] : []),
     { role: 'editMenu' }, { label: '视图', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
-    { role: 'windowMenu' },
+    { role: 'windowMenu' }, { label: '帮助', submenu: [{ label: '检查更新…', click: () => { void showUpdates(); } }] },
   ]));
   createWindow();
-  if (store.connection && (store.settings.backgroundEnabled || store.settings.autoStart)) {
+  await exclusive(async () => {
+    if (!store.connection) return;
     try {
-      if (await observeExternal()) { /* Existing runtime stays under its original supervisor. */ }
-      else if (store.settings.backgroundEnabled) { await background.enable(store.settings, store.connection); await publishBackground(); }
-      else await portal.start(store.settings, store.connection);
+      const updater = new RuntimeUpdater(directory, background);
+      const recovered = await updater.recover();
+      if (recovered) {
+        runtimeUpdate = { phase: 'error', message: '已恢复上次未完成升级前的 Portal；本次启动不再自动重试升级。' };
+        await publishBackground();
+        return;
+      }
+      if (app.isPackaged) {
+        const { bundle, binary: bundledBinary } = await loadRuntimeBundle(process.resourcesPath);
+        if (background.installedService) {
+          runtimeUpdate = await updater.sync(bundledBinary, bundle, store.settings, store.connection);
+          if (runtimeUpdate.phase === 'current' || runtimeUpdate.phase === 'updated') {
+            await store.save({ ...store.settings, portalBinary: bundledBinary });
+          }
+          await publishBackground();
+          // Respect a stopped service even if a stale UI preference says enabled.
+          return;
+        }
+        if (await observeExternal()) {
+          runtimeUpdate = { phase: 'skipped', message: '发现未能确认管理方式的独立 Portal，未改动其进程和文件。请先迁入客户端管理。' };
+          return;
+        }
+        await store.save({ ...store.settings, portalBinary: bundledBinary });
+        runtimeUpdate = { phase: 'current', message: '已选择随客户端附带的 Portal，下次启动按原配置运行。', portalVersion: bundle.portalVersion };
+      }
+      if (store.settings.backgroundEnabled || store.settings.autoStart) {
+        if (await observeExternal()) { /* Only identity-verified supervision is migrated. */ }
+        else if (store.settings.backgroundEnabled) {
+          await background.enable(store.settings, store.connection); await publishBackground();
+        } else await portal.start(store.settings, store.connection);
+      }
     } catch (error) {
-      portal.state = { phase: 'error', message: `Portal 自动启动失败：${(error as Error).message}`, logs: [] };
+      recoveryBlocked = await access(path.join(directory, 'runtime-update.json')).then(() => true, () => false);
+      runtimeUpdate = { phase: 'error', message: String(error) };
+      portal.state = { phase: 'error', message: `Portal 更新或启动未完成：${(error as Error).message}`, logs: [] };
       portal.emit('state', portal.state);
+      if (!quitting && window) void dialog.showMessageBox(window, { type: 'warning', title: 'Portal 更新未完成', message: runtimeUpdate.message, buttons: ['知道了'] });
     }
+  });
+  if (app.isPackaged && !process.env.BEINGS_USER_DATA) {
+    void updates.check();
+    updatePoll = setInterval(() => { void updates.check(); }, 6 * 60 * 60 * 1000);
+    updatePoll.unref();
   }
   let pollingBackground = false;
   backgroundPoll = setInterval(() => {
@@ -285,7 +347,9 @@ async function ready() {
   }, 3000);
   backgroundPoll.unref();
 }
-if (!app.requestSingleInstanceLock()) app.quit();
+const squirrelEvent = process.platform === 'win32' ? installerEvent(process.argv) : undefined;
+if (squirrelEvent) { void handleInstallerEvent(squirrelEvent, process.execPath).catch(() => { process.exitCode = 1; }).finally(() => app.quit()); }
+else if (!app.requestSingleInstanceLock()) app.quit();
 else {
   app.on('second-instance', () => { window?.restore(); window?.focus(); });
   app.whenReady().then(ready).catch(error => { dialog.showErrorBox('Beings 启动失败', String(error)); app.quit(); });
@@ -294,7 +358,7 @@ else {
   app.on('before-quit', event => {
     if (quitting || !portal) return;
     event.preventDefault(); quitting = true;
-    clearInterval(backgroundPoll);
+    clearInterval(backgroundPoll); clearInterval(updatePoll);
     townLive?.dispose();
     proxy.abortAll();
     void exclusive(async () => { await kitInstaller.dispose(); await portal.stop(); }).finally(() => app.quit());

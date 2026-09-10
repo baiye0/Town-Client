@@ -1,0 +1,45 @@
+name: Build paired client release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      TOWN_UPDATE_REPOSITORY: ${{ vars.TOWN_UPDATE_REPOSITORY || github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Validate tag matches client version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: node -e "const p=require('./package.json'); if(process.env.GITHUB_REF_NAME !== 'v'+p.version) process.exit(1)"
+      - run: cargo test --manifest-path heart-portal/Cargo.toml --locked -- --test-threads=1
+      - run: npm run build:portal
+      - run: npm run make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Town-Client-${{ matrix.os }}
+          path: |
+            out/make/
+            resources/runtime-bundle.json
+          if-no-files-found: error
+          retention-days: 30
+# Artifacts are intentionally reviewed before publication. Publish both platforms
+# together as a non-prerelease vX.Y.Z release in TOWN_UPDATE_REPOSITORY.

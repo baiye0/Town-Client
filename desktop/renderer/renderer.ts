@@ -9,6 +9,13 @@ import type { PortalState, Snapshot } from '../shared';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const api = window.beings;
+const updateLabel = (state: import('../updates').UpdateState) => {
+  $('check-updates').textContent = state.phase === 'available' ? `更新至 ${state.latestVersion}` : state.phase === 'checking' ? '正在检查更新…' : '检查更新';
+};
+$('check-updates').addEventListener('click', () => action(() => api.checkUpdates()));
+api.onUpdate(updateLabel);
+void api.updateState().then(updateLabel);
+
 let snapshot: Snapshot;
 let saving = false;
 let theme: 'light' | 'dark' = 'light';

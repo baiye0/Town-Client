@@ -12,7 +12,7 @@ const config: ForgeConfig = {
     executableName: 'beings',
     appBundleId: 'town.beings.desktop',
     icon: path.resolve('resources/branding/app'),
-    extraResource: [binary, path.resolve('resources/HEART-PORTAL-LICENSE'), path.resolve('resources/branding')],
+    extraResource: [binary, path.resolve('resources/HEART-PORTAL-LICENSE'), path.resolve('resources/branding'), path.resolve('resources/runtime-bundle.json')],
   },
   hooks: {
     prePackage: async () => {

@@ -109,7 +109,7 @@ npm run package  # out/ 中生成可运行的应用目录
 npm run make     # macOS/Linux: ZIP；Windows: ZIP + Squirrel 安装程序
 ```
 
-当前配置未设置代码签名、公证或自动更新。跨平台源码已配置，Windows 安装包和进程生命周期
+已支持检查正式版本，以及手动更新客户端后自动同步 Portal 与守护；详见 [配套更新说明](desktop/UPDATING.md)。当前未配置代码签名、公证或应用自动下载/替换。跨平台源码已配置，Windows 安装包和进程生命周期
 仍需在 Windows 机器上验收；在 macOS 上构建出的包不能直接作为 Windows 安装包。
 
 如果首次下载 Electron 因网络超时失败，可按 Electron 官方支持的镜像方式，临时设置

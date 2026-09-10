@@ -2,6 +2,13 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { DesktopAPI, PortalState, TownLiveState } from './shared';
 const api: DesktopAPI = {
   platform: process.platform,
+  checkUpdates: () => ipcRenderer.invoke('beings:check-updates'),
+  updateState: () => ipcRenderer.invoke('beings:update-state'),
+  onUpdate: callback => {
+    const listener = (_event: unknown, state: import('./updates').UpdateState) => callback(state);
+    ipcRenderer.on('beings:update-state', listener);
+    return () => ipcRenderer.removeListener('beings:update-state', listener);
+  },
   appearance: theme => ipcRenderer.invoke('beings:appearance', theme),
   town: query => ipcRenderer.invoke('beings:town', query),
   townLive: () => ipcRenderer.invoke('beings:town-live'),

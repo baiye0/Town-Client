@@ -9,3 +9,5 @@ resources/heart-portal*
 *.log
 test-results/
 .env*
+
+resources/runtime-bundle.json
