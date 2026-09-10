@@ -13,7 +13,7 @@ export interface InstallIntent {
 export class ClientInstall {
   private file: string;
   constructor(directory: string, private background: BackgroundPortal,
-    private discover = (connection: Connection) => new ExternalPortalObserver().forUpgrade(connection, background.label, background.installedService?.root)) {
+    private discover = (connection: Connection) => new ExternalPortalObserver().forUpgrade(connection, background.label, background.installedService?.kind === 'portable' ? undefined : background.installedService?.root)) {
     this.file = path.join(directory, 'client-install.json');
   }
   async read(): Promise<InstallIntent | null> {
@@ -29,7 +29,11 @@ export class ClientInstall {
     const external = connection ? await this.discover(connection) : [];
     const services: InstallIntent['services'] = [];
     if (this.background.installedService) services.push({ service: this.background.installedService, enabled: (await this.background.refresh()).enabled });
-    for (const service of external) if (!services.some(s => s.service.root === service.root)) services.push({ service, enabled: true });
+    for (const service of external) {
+      const existing = services.find(s => s.service.root === service.root);
+      if (existing?.service.kind === 'portable') existing.service = service;
+      else if (!existing) services.push({ service, enabled: true });
+    }
     const intent: InstallIntent = { schema: 1, from, target, services, foreground };
     await atomic(this.file, JSON.stringify(intent));
     try { for (const item of services) await this.background.unload(item.service); }

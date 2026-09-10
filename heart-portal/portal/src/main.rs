@@ -155,7 +155,6 @@ async fn main() -> Result<()> {
         return connection_status::show();
     }
     let runtime_started = std::time::Instant::now();
-    connection_status::publish("starting");
     let cli = Cli::parse();
     if std::env::var_os("HEART_PORTAL_EXTERNAL_TOOL").is_some() {
         // Prevent accidental recursive host administration from managed MCP
@@ -434,6 +433,7 @@ async fn main() -> Result<()> {
     let _single_instance =
         single_instance::acquire(Some(&instance_identity)).map_err(|e| anyhow::anyhow!(e))?;
 
+    connection_status::publish("starting");
     config.prepare_workspace()?;
     info!(
         "Workspace ready: {}",
@@ -621,6 +621,7 @@ async fn main() -> Result<()> {
             }
             accept = listener.accept() => {
                 let (stream, peer) = accept.context("MCP listener accept failed")?;
+                if active_connections.load(std::sync::atomic::Ordering::SeqCst) >= 16 { drop(stream); continue; }
                 let conn_count = active_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 info!("MCP client connected from {} (active: {})", peer, conn_count);
 
@@ -819,11 +820,12 @@ where
     let mut auth_bytes = Vec::new();
 
     if let Some(expected) = expected_token.filter(|t| !t.is_empty()) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             auth_bytes.clear();
-            let bytes_read = tokio::time::timeout(
-                Duration::from_secs(10),
-                crate::mcp::limits::read_line_append(&mut reader, &mut auth_bytes, 64 * 1024),
+            let bytes_read = tokio::time::timeout_at(
+                deadline,
+                crate::mcp::limits::read_line_append(&mut reader, &mut auth_bytes, 4096),
             )
             .await
             .context("MCP authentication timed out")??;
@@ -1060,7 +1062,8 @@ where
         } else {
             mcp::limits::WORK_REQUESTS
         };
-        if tasks.len() >= limit {
+        let permit = tool_host.request_permit(is_management);
+        if tasks.len() >= limit || permit.is_err() {
             let response = JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 id: request.id,
@@ -1079,7 +1082,7 @@ where
         let name = portal_name.to_string();
         let id = request.id.unwrap();
         let handle =
-            tasks.spawn(async move { (handle_request(&request, &host, &name).await, restart) });
+            tasks.spawn(async move { let _permit = permit.unwrap(); (handle_request(&request, &host, &name).await, restart) });
         active_requests.insert(id, handle);
     }
 }
@@ -1237,6 +1240,7 @@ async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     response: &JsonRpcResponse,
 ) -> Result<()> {
     let json = serde_json::to_string(response)?;
+    anyhow::ensure!(json.len() <= 16 * 1024 * 1024, "MCP response exceeds frame limit");
     debug!("Sending MCP response ({} bytes)", json.len());
     tokio::time::timeout(Duration::from_secs(10), async {
         writer.write_all(json.as_bytes()).await?;

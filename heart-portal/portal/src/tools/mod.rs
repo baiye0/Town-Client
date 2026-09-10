@@ -38,6 +38,9 @@ pub struct ToolInfo {
 /// Hosts all available tools (built-in + custom + kit), dispatches calls
 #[derive(Clone)]
 pub struct ToolHost {
+    file_mutation: Arc<tokio::sync::Mutex<()>>,
+    requests: Arc<tokio::sync::Semaphore>,
+    control_requests: Arc<tokio::sync::Semaphore>,
     config: PortalConfig,
     custom: CustomToolHost,
     kits: KitManager,
@@ -74,6 +77,9 @@ impl ToolHost {
         };
 
         Self {
+            file_mutation: Arc::new(tokio::sync::Mutex::new(())),
+            requests: Arc::new(tokio::sync::Semaphore::new(16)),
+            control_requests: Arc::new(tokio::sync::Semaphore::new(4)),
             runtime: Arc::new(runtime),
             config: config.clone(),
             custom: CustomToolHost::new(),
@@ -98,6 +104,18 @@ impl ToolHost {
                     }
                 },
         }
+    }
+
+    pub(crate) fn request_permit(
+        &self,
+        control: bool,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let slots = if control {
+            &self.control_requests
+        } else {
+            &self.requests
+        };
+        Ok(slots.clone().try_acquire_owned()?)
     }
 
     /// Wait until a tool caller has requested a controlled Portal restart.
@@ -582,6 +600,20 @@ impl ToolHost {
 
     /// Execute a tool call (built-in or custom)
     pub async fn call(&self, tool_name: &str, arguments: Value) -> Result<Value> {
+        let enabled = match tool_name {
+            "portal_exec" | "portal_process" => self.config.tools.exec,
+            "portal_file_read" | "portal_file_write" | "portal_file_list" | "portal_file_edit" => {
+                self.config.tools.file
+            }
+            "portal_screenshot" => self.config.tools.screenshot,
+            "portal_web_fetch" => self.config.tools.web_fetch,
+            "portal_search" => self.config.tools.search,
+            "portal_tools_reload" => self.config.tools.custom_tools_enabled,
+            "portal_kit_usage" => self.config.kits_enabled,
+            _ => true,
+        };
+        anyhow::ensure!(enabled, "{tool_name} is disabled in configuration");
+
         // Reserve the diagnostic endpoint: an installed server must not replace
         // a read-only status query with an arbitrary custom or kit operation.
         if tool_name == "portal_status" {
@@ -623,9 +655,9 @@ impl ToolHost {
                 process::handle(&self.process_manager, arguments).await
             }
             "portal_file_read" => file::read(&self.config, arguments).await,
-            "portal_file_write" => file::write(&self.config, arguments).await,
+            "portal_file_write" => { let _guard = self.file_mutation.lock().await; file::write(&self.config, arguments).await },
             "portal_file_list" => file::list(&self.config, arguments).await,
-            "portal_file_edit" => file::edit(&self.config, arguments).await,
+            "portal_file_edit" => { let _guard = self.file_mutation.lock().await; file::edit(&self.config, arguments).await },
             "portal_screenshot" => {
                 if !self.config.tools.screenshot {
                     anyhow::bail!("portal_screenshot is disabled in configuration");
@@ -976,4 +1008,42 @@ mod restart_tests {
         handler.abort();
         let _ = handler.await;
     }
+    #[tokio::test]
+    async fn process_and_request_capacity_is_reserved_atomically() {
+        let host = ToolHost::new(&PortalConfig {
+            kits_enabled: false,
+            ..Default::default()
+        });
+        let slots: Vec<_> = (0..16)
+            .map(|_| host.request_permit(false).unwrap())
+            .collect();
+        assert!(host.request_permit(false).is_err());
+        assert!(
+            host.request_permit(true).is_ok(),
+            "control requests need independent capacity"
+        );
+        drop(slots);
+        assert!(host.request_permit(false).is_ok());
+        let slots: Vec<_> = (0..10)
+            .map(|_| host.process_manager.reserve().unwrap())
+            .collect();
+        assert!(host.process_manager.reserve().is_err());
+        drop(slots);
+        assert!(host.process_manager.reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn disabled_builtin_tools_are_rejected_before_execution() {
+        let mut config = PortalConfig::default();
+        config.kits_enabled = false;
+        config.tools.file = false;
+        config.tools.search = false;
+        config.tools.web_fetch = false;
+        let host = ToolHost::new(&config);
+        for tool in ["portal_file_read", "portal_file_write", "portal_file_edit", "portal_file_list", "portal_search", "portal_web_fetch"] {
+            let error = host.call(tool, serde_json::json!({})).await.unwrap_err();
+            assert!(error.to_string().contains("disabled"), "{tool}: {error}");
+        }
+    }
+
 }
