@@ -2,7 +2,7 @@ import { expect, it } from 'vitest';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { readPortalSample } from '../desktop/portal-status';
+import { readPortalSample, readPortalReady } from '../desktop/portal-status';
 
 it('rejects stale, oversized and unrelated runtime status', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-status-'));
@@ -17,5 +17,22 @@ it('rejects stale, oversized and unrelated runtime status', async () => {
     }
     await writeFile(file, ' '.repeat(8193));
     expect(await readPortalSample(file, 123, 'current-launch')).toBeNull();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+it('reads upstream state changes and readiness only for the current PID and launch nonce', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-native-status-'));
+  const file = path.join(dir, 'status.json');
+  try {
+    await writeFile(file, JSON.stringify({ pid: 123, nonce: 'launch', state: 'connected' }));
+    expect(await readPortalSample(file, 123, 'launch')).toMatchObject({ native: true, state: 'connected' });
+    expect(await readPortalSample(file, 124, 'launch')).toBeNull();
+    expect(await readPortalSample(file, 123, 'previous')).toBeNull();
+    await writeFile(file, JSON.stringify({ pid: 123, nonce: 'launch', version: '0.8.2' }));
+    expect(await readPortalReady(file, 123, 'launch')).toBe(true);
+    expect(await readPortalReady(file, 123, 'previous')).toBe(false);
+    await writeFile(file, '{"pid":123');
+    expect(await readPortalSample(file, 123, 'launch')).toBeNull();
+    expect(await readPortalReady(file, 123, 'launch')).toBe(false);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

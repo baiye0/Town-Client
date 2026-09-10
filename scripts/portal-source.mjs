@@ -10,7 +10,7 @@ export async function requirePortalSource() {
   } catch {
     throw new Error(process.env.HEART_PORTAL_SOURCE
       ? `Portal source missing at ${portalSource}. Check HEART_PORTAL_SOURCE.`
-      : 'Portal source missing from heart-portal/. Restore the source directory or set HEART_PORTAL_SOURCE.');
+      : 'Portal source missing from heart-portal/. Run git submodule update --init --recursive, or set HEART_PORTAL_SOURCE.');
   }
   return portalSource;
 }

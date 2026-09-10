@@ -4,29 +4,45 @@ import type { PortalState } from './shared';
 export interface PortalSample {
   schema: 1; pid: number; nonce: string; boot_id: string; sequence: number;
   state: string; updated_at_ms: number;
+  native?: true;
+}
+async function readStatus(file: string) {
+  const handle = await open(file, 'r');
+  try {
+    const bytes = Buffer.alloc(8193);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    if (bytesRead > 8192) return null;
+    return JSON.parse(bytes.subarray(0, bytesRead).toString());
+  } finally { await handle.close(); }
+}
+
+export async function readPortalReady(file: string, pid: number, nonce: string): Promise<boolean> {
+  try {
+    const ready = await readStatus(file);
+    return Boolean(nonce && ready?.pid === pid && ready?.nonce === nonce);
+  } catch { return false; }
 }
 // Telemetry from the selected runtime only; never grants ownership or permissions.
 export async function readPortalSample(file: string, pid: number, nonce: string): Promise<PortalSample | null> {
   try {
-    const handle = await open(file, 'r');
-    let bytes: Buffer;
-    try {
-      bytes = Buffer.alloc(8193);
-      const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-      if (bytesRead > 8192) return null;
-      bytes = bytes.subarray(0, bytesRead);
-    } finally { await handle.close(); }
-    const s = JSON.parse(bytes.toString());
+    const s = await readStatus(file);
     const now = Date.now();
-    if (s.schema !== 1 || s.pid !== pid || !nonce || s.nonce !== nonce ||
-        typeof s.boot_id !== 'string' || !s.boot_id || !Number.isSafeInteger(s.sequence) || s.sequence < 1 ||
-        !Number.isSafeInteger(s.updated_at_ms) || s.updated_at_ms > now + 5000 || now - s.updated_at_ms > 120_000 ||
+    if (!s || s.pid !== pid || !nonce || s.nonce !== nonce ||
         !['starting', 'connecting', 'connected', 'retrying', 'auth_required', 'invalid', 'local'].includes(s.state)) return null;
+    // Upstream publishes state changes with PID + per-launch nonce, without a
+    // heartbeat timestamp. Callers first verify the selected process is alive;
+    // never apply the legacy heartbeat expiry to this native protocol.
+    if (s.schema === undefined) return { schema: 1, pid, nonce, boot_id: nonce,
+      sequence: 1, state: s.state, updated_at_ms: now, native: true };
+    if (s.schema !== 1 ||
+        typeof s.boot_id !== 'string' || !s.boot_id || !Number.isSafeInteger(s.sequence) || s.sequence < 1 ||
+        !Number.isSafeInteger(s.updated_at_ms) || s.updated_at_ms > now + 5000 || now - s.updated_at_ms > 120_000) return null;
     return s;
   } catch { return null; }
 }
 
-export function portalSampleState(sample: PortalSample | null): Pick<PortalState, 'phase' | 'message'> {
+export function portalSampleState(sample: PortalSample | null, ready = false): Pick<PortalState, 'phase' | 'message'> {
+  if (!sample && ready) return { phase: 'running', message: 'Portal 本地服务已就绪；当前引擎未提供云端连接状态。' };
   if (!sample) return { phase: 'starting', message: 'Portal 进程正在运行，等待有效连接状态；旧版 Portal 不提供此状态。' };
   switch (sample.state) {
     case 'connected': return { phase: 'connected', message: 'Portal 已连接云端 Being，等待工具调用' };

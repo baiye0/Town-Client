@@ -4,7 +4,7 @@ import path from 'node:path';
 import { BackgroundPortal, atomic, command, fingerprint, unixRunner, windowsRunner, type Service } from './background';
 import type { Connection } from './connection';
 import type { Settings } from './shared';
-import { readPortalSample } from './portal-status';
+import { readPortalSample, readPortalReady } from './portal-status';
 import { ExternalPortalObserver } from './external-portal';
 
 export interface RuntimeBundle { schema: 1; id: string; clientVersion: string; portalVersion: string; sha256: string; platform: string; arch: string }
@@ -52,8 +52,8 @@ export class RuntimeUpdater {
     try { transaction = JSON.parse(await readFile(this.journal, 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
     if (transaction.schema !== 1 || !transaction.previous || !transaction.candidate) throw new Error('升级恢复记录损坏，请保留运行目录并检查日志。');
-    const staging = path.join(this.directory, 'portal-service');
-    if (path.dirname(transaction.candidate.root) !== staging || transaction.candidate.root === transaction.previous.root ||
+    const staging = [this.background.runtimeDirectory, path.join(this.directory, 'portal-service')];
+    if (!staging.includes(path.dirname(transaction.candidate.root)) || transaction.candidate.root === transaction.previous.root ||
         transaction.candidate.existing || transaction.candidate.kind || !path.isAbsolute(transaction.previous.root) ||
         transaction.candidate.label !== transaction.previous.label ||
         (transaction.candidate.file !== transaction.previous.file && transaction.candidate.file !== path.join(transaction.candidate.root, 'launch.plist'))) {
@@ -109,7 +109,7 @@ export class RuntimeUpdater {
     const config = primary.configPath || settings.portalConfigPath || path.join(primary.root, 'portal.toml');
     await access(config);
     const wasEnabled = previous.kind === 'portable' || (await this.background.refresh()).enabled;
-    const root = path.join(this.directory, 'portal-service', randomUUID());
+    const root = path.join(this.background.runtimeDirectory, randomUUID());
     const candidate: Service = { label: previous.label, file: previous.kind === 'portable' ? path.join(root, 'launch.plist') : previous.file, root, existing: false, login: previous.login,
       name: primary.name || settings.portalName, environment: primary.environment, bundleId: bundle.id, legacyProcessHealth, configPath: config, cwd: primary.cwd || (primary.existing ? primary.root : settings.workspace),
       fingerprint: fingerprint({ ...settings, portalBinary: path.join(root, this.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'), portalConfigPath: config, workspace: primary.cwd || settings.workspace, portalEnvironmentPath: primary.environment?.PATH || settings.portalEnvironmentPath, portalName: primary.name || settings.portalName }, connection) };
@@ -161,8 +161,10 @@ export class RuntimeUpdater {
         const current = String(state.pid);
         if (identity !== current) { identity = current; since = Date.now(); }
         if (Date.now() - since >= 6000) return;
-      } else if (sample && !['starting', 'invalid'].includes(sample.state)) {
-        const current = `${sample.pid}:${sample.boot_id}`;
+      } else if (state.running && state.pid &&
+          (!sample || !['starting', 'invalid'].includes(sample.state)) &&
+          (sample && !sample.native || await readPortalReady(path.join(service.root, '.portal-ready.json'), state.pid, nonce.trim()))) {
+        const current = `${state.pid}:${sample?.boot_id || nonce.trim()}`;
         if (identity !== current) { identity = current; since = Date.now(); }
         if (Date.now() - since >= 2000) return;
       } else { identity = ''; since = 0; }

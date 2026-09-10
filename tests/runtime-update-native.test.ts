@@ -13,7 +13,7 @@ import type { Settings } from '../desktop/shared';
 it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('replaces the real OS supervisor offline, then restores the prior runtime after a bad candidate', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'town-native-upgrade-'));
   const directory = path.join(root, 'profile');
-  const background = new BackgroundPortal(directory, command, process.platform, root);
+  const background = new BackgroundPortal(directory);
   // Allocate a local closed port: readiness must not require the remote relay.
   const socket = createServer();
   await new Promise<void>(resolve => socket.listen(0, '127.0.0.1', resolve));
@@ -56,6 +56,7 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
       const script = windowsModulePath + `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
       await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
     }
+    await rm(path.dirname(background.runtimeDirectory), { recursive: true, force: true });
     await rm(root, { recursive: true, force: true });
   }
 // Includes a deliberate 25 s startup failure plus real OS stop/start commands.
@@ -66,8 +67,8 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
   const directory = path.join(root, 'profile');
   const background = new BackgroundPortal(directory);
   const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
-  const oldRoot = path.join(root, 'old runtime with spaces');
-  const { mkdir } = await import('node:fs/promises'); await mkdir(oldRoot);
+  const oldRoot = path.join(os.homedir(), '.heart-portal', 'clients', path.basename(root), 'old runtime with spaces');
+  const { mkdir } = await import('node:fs/promises'); await mkdir(oldRoot, { recursive: true, mode: 0o700 });
   const oldBinary = path.join(oldRoot, path.basename(binary)); await copyFile(process.env.TOWN_TEST_EXTERNAL_PORTAL || binary, oldBinary); await chmod(oldBinary, 0o700);
   const configPath = path.join(oldRoot, 'custom config.toml');
   const settings: Settings = { endpoint: '', being: '', hasToken: true, portalName: 'manual-upgrade', portalBinary: binary, workspace: oldRoot, autoStart: true, backgroundEnabled: true, allowExec: false, kitsEnabled: false };
@@ -99,16 +100,21 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
     expect(background.state.running).toBe(true);
     expect(await readFile(background.installedService!.configPath!, 'utf8')).toBe(original);
     expect(await observer.forUpgrade(connection, background.label, background.installedService!.root)).toEqual([]);
+  } catch (error) {
+    console.error('Independent runtime takeover failed:', error);
+    throw error;
   } finally {
     await background.disable();
     const { portableCommand } = await import('../desktop/background');
     await portableCommand(oldBinary, 'stop').catch(() => {});
     child?.kill();
+    await rm(path.dirname(oldRoot), { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
     if (process.platform === 'darwin' && background.installedService?.file) await rm(background.installedService.file, { force: true });
     if (process.platform === 'win32') {
       const script = windowsModulePath + `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
       await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
     }
+    await rm(path.dirname(background.runtimeDirectory), { recursive: true, force: true });
     await rm(root, { recursive: true, force: true });
   }
 }, 180_000);

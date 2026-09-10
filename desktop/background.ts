@@ -6,7 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseConnection, redact, type Connection } from './connection';
 import { portalConfig } from './portal';
-import { readPortalSample, portalSampleState } from './portal-status';
+import { readPortalSample, readPortalReady, portalSampleState } from './portal-status';
+import { clientRuntimeRoot } from './runtime-path';
 import type { BackgroundState, PortalState, Settings } from './shared';
 
 // No shell interpolation or credentials in command arguments. Windows DPAPI input uses stdin.
@@ -51,6 +52,8 @@ function environmentEntries(environment: Record<string, string>) {
 export function unixRunner(root: string, config: string, settings: Settings, environment: Record<string, string> = {}): string {
   return `#!/bin/sh\nset -eu\numask 077\n${environmentEntries(environment).map(([key, value]) => `export ${key}=${sh(value)}\n`).join('')}cd ${sh(settings.workspace)}\nexport PATH=${sh(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}\nexport PORTAL_CONNECT_LINK="$(cat ${sh(path.join(root, 'connection.url'))})"\nexport HEART_PORTAL_SUPERVISED=1 RUST_LOG=info NO_COLOR=1\n` +
     `export HEART_PORTAL_STATUS_FILE=${sh(path.join(root, '.portal-connection-status.json'))}\nexport HEART_PORTAL_STATUS_NONCE="$(/usr/bin/uuidgen)"\nprintf '%s' "$HEART_PORTAL_STATUS_NONCE" >${sh(path.join(root, '.portal-status-nonce'))}\n` +
+    `printf '%s' "$HEART_PORTAL_STATUS_NONCE" >${sh(path.join(root, '.portal-launch-nonce'))}\n` +
+    `export HEART_PORTAL_READY_FILE=${sh(path.join(root, '.portal-ready.json'))}\nexport HEART_PORTAL_READY_NONCE="$HEART_PORTAL_STATUS_NONCE"\n` +
     `for log in ${sh(path.join(root, 'portal.log'))} ${sh(path.join(root, 'portal.err.log'))}; do [ ! -f "$log" ] || mv -f "$log" "$log.previous"; done\n` +
     `exec ${sh(path.join(root, 'heart-portal'))} --config ${sh(config)} --name ${sh(settings.portalName)} >${sh(path.join(root, 'portal.log'))} 2>${sh(path.join(root, 'portal.err.log'))}\n`;
 }
@@ -70,6 +73,8 @@ while ($true) {
     $env:HEART_PORTAL_STATUS_FILE = Join-Path $root '.portal-connection-status.json'
     $env:HEART_PORTAL_STATUS_NONCE = [Guid]::NewGuid().ToString()
     [IO.File]::WriteAllText((Join-Path $root '.portal-status-nonce'), $env:HEART_PORTAL_STATUS_NONCE)
+    $env:HEART_PORTAL_READY_FILE = Join-Path $root '.portal-ready.json'
+    $env:HEART_PORTAL_READY_NONCE = $env:HEART_PORTAL_STATUS_NONCE
     $si = New-Object System.Diagnostics.ProcessStartInfo
     $si.FileName = Join-Path $root 'heart-portal.exe'
     $si.Arguments = ${ps('--config ' + windowsArgument(config) + ' --name ' + windowsArgument(settings.portalName))}
@@ -122,6 +127,7 @@ export class BackgroundPortal {
   private connection: Connection | null = null;
   state: BackgroundState;
   readonly label: string;
+  get runtimeDirectory() { return path.join(clientRuntimeRoot(this.directory, this.home), 'portal-service'); }
   constructor(private directory: string, private run: Command = command, private platform = process.platform, private home = os.homedir()) {
     this.label = `town.beings.desktop.portal.${hash(path.resolve(directory))}`;
     this.state = { supported: ['darwin', 'win32'].includes(platform), installed: false, enabled: false, running: false, existing: false,
@@ -225,7 +231,8 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
       .catch(() => readFile(path.join(root, '.portal-launch-nonce'), 'utf8')).catch(() => '')).trim();
     const sample = this.state.running && this.state.pid
       ? await readPortalSample(path.join(root, '.portal-connection-status.json'), this.state.pid, nonce) : null;
-    const state = portalSampleState(sample);
+    const ready = !sample && this.state.running && this.state.pid && await readPortalReady(path.join(root, '.portal-ready.json'), this.state.pid, nonce);
+    const state = portalSampleState(sample, Boolean(ready));
     return { ...state, phase: !this.state.enabled || !this.state.running ? 'stopped' : state.phase,
       pid: this.state.pid, message: !this.state.enabled ? this.state.message : this.state.running ? state.message : '后台 Portal 当前未运行；尚未确认自动恢复', logs };
   }
@@ -240,7 +247,7 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
     }
     await access(settings.portalBinary, this.platform === 'win32' ? constants.F_OK : constants.X_OK);
     if (settings.portalConfigPath) await access(settings.portalConfigPath, constants.R_OK);
-    const root = path.join(this.directory, 'portal-service', randomUUID());
+    const root = path.join(this.runtimeDirectory, randomUUID());
     await mkdir(root, { recursive: true, mode: 0o700 });
     let registrationChanged = false;
     let wasEnabled = false;

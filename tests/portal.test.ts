@@ -20,7 +20,7 @@ async function fixture() {
     child.kill.mockImplementation(() => { queueMicrotask(() => child.emit('exit', 0)); return true; });
     children.push(child); return child;
   });
-  const portal = new PortalSupervisor(dir, spawn as any);
+  const portal = new PortalSupervisor(dir, spawn as any, dir);
   return { dir, portal, spawn, children };
 }
 describe('Portal supervision', () => {

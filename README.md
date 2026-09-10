@@ -13,20 +13,21 @@
 ```text
 Town-Client/        # 当前项目
   desktop/          # Electron 客户端
-  heart-portal/     # 随仓库维护的 Rust Portal 源码
+  heart-portal/     # Git 子模块，锁定 Portal 源码提交
   scripts/          # 客户端与引擎的构建入口
 ```
 
 ```bash
-git clone https://github.com/baiye0/Town-Client.git
+git clone --recurse-submodules https://github.com/baiye0/Town-Client.git
 cd Town-Client
 npm ci
 npm run build:portal
 npm start
 ```
 
-客户端与 Portal 源码由同一次提交记录，普通克隆即可完整获取，不需要初始化子模块。
-源码来源与导入版本见 [UPSTREAM.md](UPSTREAM.md)。
+`heart-portal/` 是源码子模块，客户端提交锁定具体引擎版本。已有克隆运行 `git submodule update --init --recursive`。
+Portal 跟随客户端在 macOS / Windows 上编译、打包与发布，不依赖单独的 Portal 发布包。
+源码来源与子模块更新方式见 [UPSTREAM.md](UPSTREAM.md)。
 
 `build:portal` 用 `cargo build --release --locked` 构建仓库内 Portal 源码，并复制当前平台的
 二进制到 Git 忽略的 `resources/`。也可以设置 `HEART_PORTAL_SOURCE` 指向另一个源码目录。

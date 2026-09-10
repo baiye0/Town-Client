@@ -1,9 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, writeFile, access } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { stageForegroundBinary } from './runtime-path';
 import { randomUUID } from 'node:crypto';
-import { readPortalSample, portalSampleState } from './portal-status';
+import { readPortalSample, readPortalReady, portalSampleState } from './portal-status';
 import { EventEmitter } from 'node:events';
 import { StringDecoder } from 'node:string_decoder';
 import type { Connection } from './connection';
@@ -27,7 +29,7 @@ export class PortalSupervisor extends EventEmitter {
 
   get managing() { return Boolean(this.child || this.wanted); }
 
-  constructor(private directory: string, private spawnProcess: typeof spawn = spawn) { super(); }
+  constructor(private directory: string, private spawnProcess: typeof spawn = spawn, private home = os.homedir()) { super(); }
   private publish(patch: Partial<PortalState>) {
     this.state = { ...this.state, ...patch };
     this.emit('state', this.state);
@@ -46,7 +48,8 @@ export class PortalSupervisor extends EventEmitter {
     if (settings.portalConfigPath) await access(configPath, constants.R_OK);
     else await writeFile(configPath, portalConfig(settings), { mode: 0o600 });
     this.secrets = [connection.token, connection.relaySecret];
-    this.run = { settings: { ...settings }, connection: { ...connection }, configPath };
+    const binary = await stageForegroundBinary(settings.portalBinary, this.directory, this.home);
+    this.run = { settings: { ...settings, portalBinary: binary }, connection: { ...connection }, configPath };
     this.wanted = true;
     this.crashes = 0;
     this.launch();
@@ -58,12 +61,16 @@ export class PortalSupervisor extends EventEmitter {
     this.publish({ phase: 'starting', message: '正在启动本机 Portal…', pid: undefined, managed: true, runtimePath: undefined });
     const startedAt = Date.now();
     const nonce = randomUUID();
-    const statusPath = path.join(this.directory, 'portal-status.json');
+    const root = path.dirname(settings.portalBinary);
+    const statusPath = path.join(root, '.portal-connection-status.json');
+    try { writeFileSync(path.join(root, '.portal-launch-nonce'), nonce, { mode: 0o600 }); }
+    catch { this.wanted = false; this.publish({ phase: 'error', message: '无法写入 Portal 启动记录。' }); return; }
     const child = this.spawnProcess(settings.portalBinary, ['--config', configPath, '--name', settings.portalName], {
       cwd: settings.workspace,
       shell: false, windowsHide: true, detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ...(settings.portalEnvironmentPath ? { PATH: settings.portalEnvironmentPath } : {}), PORTAL_CONNECT_LINK: connection.link, HEART_PORTAL_SUPERVISED: '1', HEART_PORTAL_STATUS_FILE: statusPath, HEART_PORTAL_STATUS_NONCE: nonce,
+        HEART_PORTAL_READY_FILE: path.join(root, '.portal-ready.json'), HEART_PORTAL_READY_NONCE: nonce,
         RUST_LOG: 'info', NO_COLOR: '1' },
     });
     this.child = child;
@@ -96,7 +103,9 @@ export class PortalSupervisor extends EventEmitter {
           return;
         }
         if (sample) { boot = sample.boot_id; lastSequence = sample.sequence; }
-        this.publish(portalSampleState(sample));
+        const ready = !sample && await readPortalReady(path.join(root, '.portal-ready.json'), child.pid, nonce);
+        if (finished || this.child !== child || !this.wanted) return;
+        this.publish(portalSampleState(sample, Boolean(ready)));
       } finally { polling = false; }
     }, 1000);
     statusTimer.unref?.();

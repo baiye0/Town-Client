@@ -1,6 +1,6 @@
 # 构建、打包与交付
 
-本文对应 `package.json`、`scripts/build-portal.mjs`、`scripts/prepare-desktop.mjs` 和 `forge.config.ts`。桌面版本由 `package.json` 决定（当前 0.1.0）；根目录 `VERSION` 的 1.3.0 是原单文件 Loom 的版本，二者独立。
+本文对应 `package.json`、`scripts/build-portal.mjs`、`scripts/prepare-desktop.mjs` 和 `forge.config.ts`。桌面版本由 `package.json` 决定；根目录 `VERSION` 的 1.3.0 是原单文件 Loom 的版本，二者独立。
 
 ## 支持范围与前置条件
 
@@ -16,21 +16,21 @@ Electron 与 Portal 必须来自同一目标操作系统和架构。目前脚本
 
 ## 从全新克隆开始
 
-Portal 源码直接包含在 `heart-portal/` 目录中，和客户端一起提交。以下命令可在 macOS/Linux shell 或 Windows PowerShell 中逐行执行。
+Portal 源码通过 `heart-portal/` 子模块引用，由客户端提交锁定版本。以下命令可在 macOS/Linux shell 或 Windows PowerShell 中逐行执行。
 
 ```text
-git clone https://github.com/baiye0/Town-Client.git
+git clone --recurse-submodules https://github.com/baiye0/Town-Client.git
 cd Town-Client
 npm ci
 npm run build:portal
 npm start
 ```
 
-普通克隆和 GitHub Download ZIP 都包含完整 Portal 源码，不需要子模块初始化。更新客户端时也会取得对应版本的引擎代码。
+已有克隆或拉取客户端更新后，运行 `git submodule update --init --recursive`，取得客户端锁定的 Portal 提交。GitHub Download ZIP 不包含子模块源码，源码构建请使用 Git 克隆。
 
 ### 更新 Portal
 
-直接修改或合入经审核的 Portal 源码，在客户端和引擎验证通过后一起提交。`heart-portal/` 是本仓库的普通目录，不单独 checkout 或推送；保留其许可声明，并在需要时更新根目录 `UPSTREAM.md` 的来源记录。
+运行 `git submodule update --remote heart-portal` 显式取得原仓库 `main` 的最新提交。验证客户端和引擎后，在 Town-Client 中提交子模块引用并更新 `UPSTREAM.md`。构建只使用锁定提交，不自动拉取远端代码；Portal 的编译、安装包与发布均跟随客户端。
 
 仓库不提交 `node_modules/`、Portal 二进制、生成的网页资产或 `out/`。`npm ci` 根据 `package-lock.json` 安装依赖；首次构建需要联网下载 Electron、npm 包和 Cargo 依赖。`npm start` 先生成离线网页资产，再启动开发模式。
 
@@ -62,7 +62,7 @@ npm run package
 npm run make
 ```
 
-`package` 生成可运行目录；`make` 会自行再次执行 package，并制作分发包，所以仅需分发包时可以跳过独立的 `npm run package`。两者都会生成本地聊天资源，不运行自动化测试。
+`package` 生成可运行目录；`make` 会自行再次执行 package，并制作分发包，所以仅需分发包时可以跳过独立的 `npm run package`。两者都会先编译子模块 Portal，再生成本地聊天资源并打包；不运行自动化测试。
 
 | 命令 / 平台 | 输出位置（`<arch>` 为当前架构，`<version>` 为桌面版本） |
 | --- | --- |
@@ -72,7 +72,7 @@ npm run make
 | make / ZIP | `out/make/zip/<platform>/<arch>/Beings-<platform>-<arch>-<version>.zip` |
 | make / Windows Setup | `out/make/squirrel.windows/<arch>/Beings-<version> Setup.exe`，同目录另有 `RELEASES` 和 `beings-<version>-full.nupkg` |
 
-ZIP 含完整应用目录和内置 Portal。不要只拷贝 Windows 的单个 exe 或 macOS `.app` 中的单个可执行文件。当前没有 DMG、MSI、AppImage、deb/rpm，也没有自动发布到 GitHub Releases 的命令。
+ZIP 含完整应用目录和内置 Portal。不要只拷贝 Windows 的单个 exe 或 macOS `.app` 中的单个可执行文件。当前没有 DMG、MSI、AppImage、deb/rpm。版本标签触发 macOS / Windows 配套构建，全部验证通过后才发布 GitHub Release。
 
 macOS 可将解压后的 `Beings.app` 放到 Applications 或稳定的用户目录再启动。Windows ZIP 应解压到当前用户可写的稳定目录再运行 `beings.exe`，不要直接在压缩包预览里启动。
 
@@ -80,7 +80,7 @@ macOS 可将解压后的 `Beings.app` 放到 Applications 或稳定的用户目�
 
 客户端已处理 Squirrel 安装、更新和卸载事件，由安装程序创建或移除快捷方式；这些短进程不会启动 Portal。Windows Setup 升级及后台任务仍需实机验收。
 
-当前均为未签名的开发/试用包：未配置 macOS Developer ID、公证、Windows Authenticode、应用自动下载/替换。操作系统可能提示来源未验证；正式公开发布前应配置签名并在目标系统验收。Electron 的下载校验不等于应用代码签名。
+当前未配置 macOS Developer ID、公证或 Windows Authenticode。客户端支持用户主动下载并安装更新。操作系统可能提示来源未验证；正式公开发布前应配置签名并在目标系统验收。Electron 的下载校验不等于应用代码签名。
 
 ## 网络与常见失败
 

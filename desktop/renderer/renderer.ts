@@ -48,7 +48,7 @@ $('refresh-chat').addEventListener('click', () => {
   if (snapshot?.settings.hasToken && !chatLoading) applySnapshot(snapshot, true);
 });
 let toastTimer: ReturnType<typeof setTimeout>;
-const labels = { stopped: '未启动', starting: '启动中', connected: '已连接', reconnecting: '重连中', stopping: '停止中', external: '独立服务运行中', error: '启动失败' };
+const labels = { running: '运行中', stopped: '未启动', starting: '启动中', connected: '已连接', reconnecting: '重连中', stopping: '停止中', external: '独立服务运行中', error: '启动失败' };
 function toast(error: unknown) {
   $('toast').textContent = String(error instanceof Error ? error.message : error).replace(/^Error invoking remote method '[^']+': Error: /, '');
   $('toast').hidden = false; clearTimeout(toastTimer);

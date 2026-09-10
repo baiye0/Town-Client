@@ -90,10 +90,10 @@ it('retains a newer engine while updating its supervisor once, and rejects corru
   await expect(f.updater().sync(f.binary, f.bundle, f.settings, f.connection)).rejects.toThrow('校验失败');
   expect(f.calls).toEqual([]);
 });
-it('recovers an interrupted switch on next startup before retrying any upgrade', async () => {
+it.each(['legacy', 'upstream'])('recovers an interrupted %s runtime switch before retrying any upgrade', async location => {
   const f = await fixture();
-  const candidate = { ...f.previous, root: path.join(f.profile, 'portal-service/interrupted') };
-  await mkdir(candidate.root);
+  const candidate = { ...f.previous, root: path.join(location === 'legacy' ? path.join(f.profile, 'portal-service') : f.background.runtimeDirectory, 'interrupted') };
+  await mkdir(candidate.root, { recursive: true });
   await writeFile(path.join(f.profile, 'runtime-update.json'), JSON.stringify({ schema: 1, previous: f.previous, candidate, enabled: true, previousPlist: await readFile(f.previous.file, 'utf8') }));
   await f.background.unload(f.previous);
   await f.background.installRegistration(candidate);

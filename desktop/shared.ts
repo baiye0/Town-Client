@@ -24,7 +24,7 @@ export interface SaveSettings {
   portalConfigPath?: string;
   portalEnvironmentPath?: string;
 }
-export type PortalPhase = 'stopped' | 'starting' | 'connected' | 'reconnecting' | 'stopping' | 'external' | 'error';
+export type PortalPhase = 'running' | 'stopped' | 'starting' | 'connected' | 'reconnecting' | 'stopping' | 'external' | 'error';
 export interface PortalState { phase: PortalPhase; pid?: number; managed?: boolean; runtimePath?: string; message: string; logs: string[] }
 export interface BackgroundState { supported: boolean; installed: boolean; enabled: boolean; running: boolean; existing: boolean; label?: string; pid?: number; message: string }
 export interface Snapshot { settings: Settings; portal: PortalState; background?: BackgroundState }
