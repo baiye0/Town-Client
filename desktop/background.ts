@@ -7,7 +7,6 @@ import path from 'node:path';
 import { parseConnection, redact, type Connection } from './connection';
 import { portalConfig } from './portal';
 import { readPortalSample, readPortalReady, portalSampleState } from './portal-status';
-import { clientRuntimeRoot } from './runtime-path';
 import type { BackgroundState, PortalState, Settings } from './shared';
 
 // No shell interpolation or credentials in command arguments. Windows DPAPI input uses stdin.
@@ -50,7 +49,7 @@ function environmentEntries(environment: Record<string, string>) {
   return Object.entries(environment).filter(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0'));
 }
 export function unixRunner(root: string, config: string, settings: Settings, environment: Record<string, string> = {}): string {
-  return `#!/bin/sh\nset -eu\numask 077\n${environmentEntries(environment).map(([key, value]) => `export ${key}=${sh(value)}\n`).join('')}cd ${sh(settings.workspace)}\nexport PATH=${sh(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}\nexport PORTAL_CONNECT_LINK="$(cat ${sh(path.join(root, 'connection.url'))})"\nexport HEART_PORTAL_SUPERVISED=1 RUST_LOG=info NO_COLOR=1\n` +
+  return `#!/bin/sh\nset -eu\numask 077\n${environmentEntries(environment).map(([key, value]) => `export ${key}=${sh(value)}\n`).join('')}cd ${sh(settings.workspace)}\nexport PATH=${sh(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}\nexport PORTAL_CONNECT_LINK="$(cat ${sh(path.join(root, 'connection.url'))})"\nexport HEART_PORTAL_SUPERVISED=1 HEART_PORTAL_CLIENT_MANAGED=1 RUST_LOG=info NO_COLOR=1\n` +
     `export HEART_PORTAL_STATUS_FILE=${sh(path.join(root, '.portal-connection-status.json'))}\nexport HEART_PORTAL_STATUS_NONCE="$(/usr/bin/uuidgen)"\nprintf '%s' "$HEART_PORTAL_STATUS_NONCE" >${sh(path.join(root, '.portal-status-nonce'))}\n` +
     `printf '%s' "$HEART_PORTAL_STATUS_NONCE" >${sh(path.join(root, '.portal-launch-nonce'))}\n` +
     `export HEART_PORTAL_READY_FILE=${sh(path.join(root, '.portal-ready.json'))}\nexport HEART_PORTAL_READY_NONCE="$HEART_PORTAL_STATUS_NONCE"\n` +
@@ -63,6 +62,7 @@ export function windowsRunner(root: string, config: string, settings: Settings, 
 `${environmentEntries(environment).map(([key, value]) => `$env:${key}=${ps(value)}\n`).join('')}${windowsModulePath}$env:PORTAL_CONNECT_LINK = [System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath (Join-Path $root 'connection.dpapi') -Raw | ConvertTo-SecureString)).Password
 $PID | Set-Content -LiteralPath (Join-Path $root 'supervisor.pid')
 $env:HEART_PORTAL_SUPERVISED = '1'
+$env:HEART_PORTAL_CLIENT_MANAGED = '1'
 $env:RUST_LOG = 'info'
 $env:NO_COLOR = '1'
 $env:PATH = ${ps(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '')}
@@ -127,7 +127,7 @@ export class BackgroundPortal {
   private connection: Connection | null = null;
   state: BackgroundState;
   readonly label: string;
-  get runtimeDirectory() { return path.join(clientRuntimeRoot(this.directory, this.home), 'portal-service'); }
+  get runtimeDirectory() { return path.join(this.directory, 'portal-service'); }
   constructor(private directory: string, private run: Command = command, private platform = process.platform, private home = os.homedir()) {
     this.label = `town.beings.desktop.portal.${hash(path.resolve(directory))}`;
     this.state = { supported: ['darwin', 'win32'].includes(platform), installed: false, enabled: false, running: false, existing: false,
@@ -367,18 +367,18 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login
       }
     } else await this.powershell(`$task=Get-ScheduledTask -TaskName ${ps(service.label)} -ErrorAction SilentlyContinue;
 if ($task) { Disable-ScheduledTask -TaskName ${ps(service.label)} | Out-Null; Stop-ScheduledTask -TaskName ${ps(service.label)}; }
-$pidFile=${ps(path.join(service.root, 'pid'))};
-if (Test-Path -LiteralPath $pidFile) {
-  $portalId=0; if ([int]::TryParse((Get-Content -LiteralPath $pidFile -Raw).Trim(), [ref]$portalId)) {
-    $p=Get-CimInstance Win32_Process -Filter "ProcessId = $portalId";
-    if ($p -and $p.ExecutablePath -eq ${ps(path.join(service.root, 'heart-portal.exe'))}) {
-      & taskkill.exe /PID $portalId /T /F | Out-Null;
-      if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $portalId -ErrorAction SilentlyContinue)) { throw 'Portal process tree did not stop' }
-      Wait-Process -Id $portalId -Timeout 15 -ErrorAction SilentlyContinue;
-      if (Get-Process -Id $portalId -ErrorAction SilentlyContinue) { throw 'Portal is still running' }
-    }
-  }
+# The runner may have started the engine before its PID file was written.
+# Select only this installation's executable, never a global process name kill.
+$engine=${ps(path.join(service.root, 'heart-portal.exe'))};
+$children=@(Get-CimInstance Win32_Process -Filter "Name='heart-portal.exe'" | Where-Object { $_.ExecutablePath -eq $engine });
+foreach ($child in $children) {
+  $portalId=$child.ProcessId;
+  & taskkill.exe /PID $portalId /T /F | Out-Null;
+  if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $portalId -ErrorAction SilentlyContinue)) { throw 'Portal process tree did not stop' }
+  Wait-Process -Id $portalId -Timeout 15 -ErrorAction SilentlyContinue;
+  if (Get-Process -Id $portalId -ErrorAction SilentlyContinue) { throw 'Portal is still running' }
 }
+if (@(Get-CimInstance Win32_Process -Filter "Name='heart-portal.exe'" | Where-Object { $_.ExecutablePath -eq $engine }).Count) { throw 'Old Portal is still running' }
 $deadline=[DateTime]::UtcNow.AddSeconds(15);
 while (($task=Get-ScheduledTask -TaskName ${ps(service.label)} -ErrorAction SilentlyContinue) -and $task.State -eq 'Running') {
   if ([DateTime]::UtcNow -ge $deadline) { throw 'Portal supervisor task is still running' }

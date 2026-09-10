@@ -9,6 +9,35 @@ import { BackgroundPortal, command, windowsModulePath } from '../desktop/backgro
 import { RuntimeUpdater, digest, type RuntimeBundle } from '../desktop/runtime-update';
 import { parseConnection } from '../desktop/connection';
 import type { Settings } from '../desktop/shared';
+import { PortalSupervisor } from '../desktop/portal';
+
+it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('runs the bundled engine in the foreground without relocating or starting a second supervisor', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'town-foreground-'));
+  const portal = new PortalSupervisor(root);
+  const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
+  const settings: Settings = { endpoint: '', being: '', hasToken: true, portalName: 'foreground-fixture', portalBinary: binary, workspace: root, autoStart: false, allowExec: false, kitsEnabled: false };
+  try {
+    for (const args of [['upgrade'], ['upgrade', '--file', path.join(root, 'absent')], ['upgrade', '--target', root]]) {
+      const child = spawn(binary, ['--config', path.join(root, 'fixture.toml'), ...args], {
+        env: { ...process.env, HEART_PORTAL_CLIENT_MANAGED: '1', HEART_PORTAL_SUPERVISED: '1' }, stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let error = ''; child.stderr.on('data', data => { error += data.toString(); });
+      const code = await new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
+      expect(code).not.toBe(0);
+      expect(error).toContain('managed by Town-Client');
+    }
+    await portal.start(settings, parseConnection(`http://127.0.0.1:1/${path.basename(root)}/?token=fixture`));
+    const pid = portal.state.pid;
+    const deadline = Date.now() + 15_000;
+    while (portal.state.phase === 'starting' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 250));
+    expect(portal.state.phase).toBe('reconnecting');
+    expect(portal.state.pid).toBe(pid);
+    const ready = JSON.parse(await readFile(path.join(root, '.portal-ready.json'), 'utf8'));
+    expect(ready.pid).toBe(pid);
+    await portal.stop();
+    expect(() => process.kill(pid!, 0)).toThrow();
+  } finally { await portal.stop(); await rm(root, { recursive: true, force: true }); }
+}, 30_000);
 
 it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('replaces the real OS supervisor offline, then restores the prior runtime after a bad candidate', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'town-native-upgrade-'));
@@ -27,6 +56,13 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
   try {
     await background.enable(settings, connection);
     const old = { ...background.installedService! };
+    const started = Date.now() + 10_000;
+    while (!(await background.refresh()).running && Date.now() < started) await new Promise(resolve => setTimeout(resolve, 200));
+    const oldPid = background.state.pid;
+    expect(oldPid).toBeGreaterThan(0);
+    // Simulate a crash between process start and PID-file persistence. Stop
+    // must still find the engine belonging to this exact installation.
+    if (process.platform === 'win32') await rm(path.join(old.root, 'pid'), { force: true });
     const config = await readFile(old.configPath!, 'utf8') + '\n# retained custom configuration\n';
     await writeFile(old.configPath!, config);
     const updater = new RuntimeUpdater(directory, background);
@@ -34,6 +70,7 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
     const good = { ...background.installedService! };
     expect(good.root).not.toBe(old.root);
     expect(background.state.running).toBe(true);
+    expect(() => process.kill(oldPid!, 0)).toThrow();
     expect(await readFile(good.configPath!, 'utf8')).toBe(config);
     expect((await background.portalState()).phase).not.toBe('connected');
     // Same platform executable that exits without starting Portal.

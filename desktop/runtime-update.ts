@@ -52,8 +52,8 @@ export class RuntimeUpdater {
     try { transaction = JSON.parse(await readFile(this.journal, 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
     if (transaction.schema !== 1 || !transaction.previous || !transaction.candidate) throw new Error('升级恢复记录损坏，请保留运行目录并检查日志。');
-    const staging = [this.background.runtimeDirectory, path.join(this.directory, 'portal-service')];
-    if (!staging.includes(path.dirname(transaction.candidate.root)) || transaction.candidate.root === transaction.previous.root ||
+    const staging = this.background.runtimeDirectory;
+    if (path.dirname(transaction.candidate.root) !== staging || transaction.candidate.root === transaction.previous.root ||
         transaction.candidate.existing || transaction.candidate.kind || !path.isAbsolute(transaction.previous.root) ||
         transaction.candidate.label !== transaction.previous.label ||
         (transaction.candidate.file !== transaction.previous.file && transaction.candidate.file !== path.join(transaction.candidate.root, 'launch.plist'))) {

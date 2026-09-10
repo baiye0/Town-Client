@@ -30,7 +30,7 @@ npm start
 
 ### 更新 Portal
 
-运行 `git submodule update --remote heart-portal` 显式取得原仓库 `main` 的最新提交。验证客户端和引擎后，在 Town-Client 中提交子模块引用并更新 `UPSTREAM.md`。构建只使用锁定提交，不自动拉取远端代码；Portal 的编译、安装包与发布均跟随客户端。
+运行 `git submodule update --remote heart-portal` 显式取得兼容分支 `codex/town-client-compat` 的最新提交。兼容分支合入原仓库 `main` 的更新，仅保留客户端必要的生命周期适配。验证客户端和引擎后，在 Town-Client 中提交子模块引用并更新 `UPSTREAM.md`。构建只使用锁定提交，不自动拉取远端代码；Portal 的编译、安装包与发布均跟随客户端。
 
 仓库不提交 `node_modules/`、Portal 二进制、生成的网页资产或 `out/`。`npm ci` 根据 `package-lock.json` 安装依赖；首次构建需要联网下载 Electron、npm 包和 Cargo 依赖。`npm start` 先生成离线网页资产，再启动开发模式。
 
