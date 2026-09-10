@@ -1,0 +1,38 @@
+name: Portal runtime
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - name: macOS lifecycle and signature policy
+        if: runner.os == 'macOS'
+        env:
+          PORTAL_TEST_BINARY: ${{ github.workspace }}/target/debug/heart-portal
+        run: |
+          python3 scripts/tests/macos-lifecycle.tests.py
+          python3 scripts/tests/macos-package.tests.py
+      - name: Windows lifecycle and private state
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          .\scripts\tests\windows-lifecycle.tests.ps1
+          .\scripts\tests\windows-start-fallback.tests.ps1
+          .\scripts\tests\windows-private-state.tests.ps1
+          .\scripts\tests\windows-console.tests.ps1
+          .\scripts\tests\windows-connection-guidance.tests.ps1 -Binary 'target\debug\heart-portal.exe'
+          .\scripts\tests\windows-package.tests.ps1 -Binary 'target\debug\heart-portal.exe' -LocalOnly

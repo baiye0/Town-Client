@@ -1,0 +1,968 @@
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use serde_json::Value;
+use tokio::sync::Mutex;
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
+
+use crate::mcp::{McpConnection, McpServerConfig};
+use crate::tools::ToolInfo;
+
+use super::loader::{command_binary_exists, format_command, LoadedKit};
+
+const MAX_FAILURES: u8 = 3;
+const SPAWN_TIMEOUT_SECS: u64 = 30;
+/// After a kit is marked unhealthy, wait this long before giving it another
+/// chance so a transient failure does not require a Portal restart to recover.
+const RECOVERY_COOLDOWN_SECS: u64 = 60;
+/// Directories prepended to a kit process's PATH so kits can find common
+/// toolchains (e.g. Homebrew-installed node/python) even when launched from a
+/// launchd/systemd context with a minimal PATH.
+#[cfg(unix)]
+const KIT_EXTRA_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+const WARMUP_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Clone)]
+pub struct KitManager {
+    kits: Arc<Mutex<BTreeMap<String, KitState>>>,
+}
+
+#[derive(Clone)]
+struct KitState {
+    connect_gate: Arc<Mutex<()>>,
+    kit: LoadedKit,
+    /// Wrapped in `Arc` so a caller can clone the handle, release the manager
+    /// lock, and perform the MCP call without blocking other kits.
+    connection: Option<Arc<McpConnection>>,
+    failure_count: u8,
+    unhealthy: bool,
+    /// When the most recent failure occurred; used to gate self-healing after
+    /// `RECOVERY_COOLDOWN_SECS`.
+    last_failure_at: Option<Instant>,
+    /// Calls since last `portal_kit_usage` drain
+    unsent_calls: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct KitStatus {
+    pub name: String,
+    pub version: String,
+    pub tools: usize,
+    pub status: String,
+}
+
+impl KitManager {
+    pub fn new(kits: Vec<LoadedKit>) -> Self {
+        let mut states = BTreeMap::new();
+        for kit in kits {
+            let name = kit.manifest.name.clone();
+            if states.contains_key(&name) {
+                warn!(
+                    "Duplicate kit name '{}'; keeping the last manifest loaded",
+                    name
+                );
+            }
+            // Pre-mark unhealthy if command binary is missing or empty
+            let pre_unhealthy = !command_binary_exists(&kit.command);
+            if pre_unhealthy {
+                warn!(
+                    "Kit '{}' pre-marked unhealthy: command binary not found: {}",
+                    name,
+                    kit.command.first().map(|s| s.as_str()).unwrap_or("<empty>")
+                );
+            }
+            states.insert(
+                name,
+                KitState {
+                    connect_gate: Arc::new(Mutex::new(())),
+                    kit,
+                    connection: None,
+                    failure_count: 0,
+                    unhealthy: pre_unhealthy,
+                    last_failure_at: None,
+                    unsent_calls: 0,
+                },
+            );
+        }
+
+        Self {
+            kits: Arc::new(Mutex::new(states)),
+        }
+    }
+
+    pub async fn list_tools(&self) -> Vec<ToolInfo> {
+        let kits = self.kits.lock().await;
+        let mut tools = Vec::new();
+
+        for state in kits.values() {
+            push_kit_tools(state, &mut tools);
+        }
+
+        tools
+    }
+
+    pub async fn list_healthy_tools(&self) -> Vec<ToolInfo> {
+        let mut kits = self.kits.lock().await;
+        let mut tools = Vec::new();
+
+        for state in kits.values_mut() {
+            recover_if_cooled_down(state);
+
+            // A kit can exit independently while Portal and the relay stay
+            // connected. Reap the stale connection here so health/tool
+            // discovery reflects the kit's real state and gives it a bounded
+            // number of restart attempts instead of advertising a dead route.
+            let dead_connection = state
+                .connection
+                .as_ref()
+                .map(|connection| !connection.is_alive())
+                .unwrap_or(false);
+            if dead_connection {
+                drop_connection(state).await;
+                record_failure(state);
+            }
+
+            if state.unhealthy {
+                continue;
+            }
+            push_kit_tools(state, &mut tools);
+        }
+
+        tools
+    }
+
+    pub async fn resolve_tool(&self, tool_name: &str) -> Option<(String, String)> {
+        let kits = self.kits.lock().await;
+        for state in kits.values() {
+            for tool in &state.kit.manifest.tools {
+                let routed_name = format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name);
+                let normalized_query = tool_name.replace('-', "_");
+                if routed_name == normalized_query {
+                    return Some((state.kit.manifest.name.clone(), tool.name.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    pub async fn call_tool(
+        &self,
+        kit_name: &str,
+        tool_name: &str,
+        mut arguments: Value,
+    ) -> Result<Value> {
+        let params = {
+            let kits = self.kits.lock().await;
+            let state = kits
+                .get(kit_name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown kit: {kit_name}"))?;
+            state
+                .kit
+                .manifest
+                .tools
+                .iter()
+                .find(|tool| tool.name == tool_name)
+                .map(|tool| tool.params.clone())
+                .ok_or_else(|| anyhow::anyhow!("Unknown kit tool: {tool_name}"))?
+        };
+        let connection = self.connection(kit_name, SPAWN_TIMEOUT_SECS).await?;
+        // Heart's act DSL passes all parameter values as JSON strings; coerce
+        // them to the types declared in the kit tool's JSON Schema before the
+        // MCP call so kit-side validation does not reject e.g. limit="3".
+        coerce_kit_arguments(&mut arguments, &params);
+
+        // Phase 2: perform the MCP call WITHOUT holding the manager lock.
+        let result = connection.call_tool(tool_name, arguments).await;
+        // Release our handle so `drop_connection` below can reclaim ownership
+        // (via `Arc::try_unwrap`) to cleanly shut down a failed connection.
+        // Phase 3: re-acquire the lock only to update health bookkeeping.
+        let mut kits = self.kits.lock().await;
+        match kits.get_mut(kit_name) {
+            Some(state)
+                if state
+                    .connection
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &connection)) =>
+            {
+                match result {
+                    Ok(value) => {
+                        state.failure_count = 0;
+                        state.unsent_calls += 1;
+                        Ok(value)
+                    }
+                    Err(err) => {
+                        warn!("Kit '{}' tool '{}' failed: {}", kit_name, tool_name, err);
+                        drop_connection(state).await;
+                        record_failure(state);
+                        Err(err).with_context(|| {
+                            format!("Failed to call kit '{}' tool '{}'", kit_name, tool_name)
+                        })
+                    }
+                }
+            }
+            _ => {
+                warn!(
+                    "Kit '{}' was removed during call_tool; returning Phase 2 result as-is",
+                    kit_name
+                );
+                result.with_context(|| format!("Kit '{}' removed during call", kit_name))
+            }
+        }
+    }
+
+    /// Pre-spawn kits marked `eager: true` so the first tool call has no
+    /// cold-start latency. Failures are logged and non-fatal.
+    pub async fn warmup(&self) {
+        // Phase 1: collect eager, healthy kit names (release lock afterwards).
+        let eager_names: Vec<String> = {
+            let kits = self.kits.lock().await;
+            kits.iter()
+                .filter(|(_, state)| state.kit.manifest.eager == Some(true) && !state.unhealthy)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+
+        if eager_names.is_empty() {
+            return;
+        }
+
+        info!("Warming up {} eager kit(s)", eager_names.len());
+
+        // Phase 2: spawn each kit one at a time, releasing the lock between attempts
+        // so other callers are not blocked for the full warmup window.
+        for name in eager_names {
+            match self.connection(&name, WARMUP_TIMEOUT_SECS).await {
+                Ok(_) => info!("Warmed up eager kit '{name}'"),
+                Err(error) => warn!("Failed to warm up '{name}': {error}"),
+            }
+        }
+    }
+
+    async fn connection(&self, name: &str, timeout_secs: u64) -> Result<Arc<McpConnection>> {
+        let gate = self
+            .kits
+            .lock()
+            .await
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown kit: {name}"))?
+            .connect_gate
+            .clone();
+        let _connecting = gate.lock().await;
+        let mut snapshot = self
+            .kits
+            .lock()
+            .await
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Kit removed: {name}"))?
+            .clone();
+        anyhow::ensure!(
+            Arc::ptr_eq(&gate, &snapshot.connect_gate),
+            "Kit changed; retry discovery"
+        );
+        let result = ensure_connection_with_timeout(&mut snapshot, timeout_secs).await;
+        let mut kits = self.kits.lock().await;
+        let state = kits
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("Kit removed: {name}"))?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&gate, &state.connect_gate),
+            "Kit changed during startup"
+        );
+        state.connection = snapshot.connection;
+        state.failure_count = snapshot.failure_count;
+        state.last_failure_at = snapshot.last_failure_at;
+        state.unhealthy = snapshot.unhealthy;
+        result?;
+        state
+            .connection
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Kit has no connection"))
+    }
+
+    pub async fn shutdown(&self) {
+        let connections = {
+            let mut kits = self.kits.lock().await;
+            kits.values_mut()
+                .filter_map(|state| {
+                    state.connect_gate = Arc::new(Mutex::new(()));
+                    state.connection.take()
+                })
+                .collect::<Vec<_>>()
+        };
+        for connection in connections {
+            if let Ok(mut connection) = Arc::try_unwrap(connection) {
+                let _ = connection.shutdown().await;
+            }
+        }
+        info!("Kit processes shut down");
+    }
+
+    pub async fn statuses(&self) -> Vec<KitStatus> {
+        let kits = self.kits.lock().await;
+        kits.values()
+            .map(|state| KitStatus {
+                name: state.kit.manifest.name.clone(),
+                version: state.kit.manifest.version.clone(),
+                tools: state.kit.manifest.tools.len(),
+                status: status_text(state).to_string(),
+            })
+            .collect()
+    }
+
+    /// Reconcile in-memory kit state with a freshly scanned kit list.
+    /// Existing connections are shut down so the next tool call re-spawns
+    /// with the updated manifest; `unsent_calls` is preserved.
+    pub async fn refresh_kits(&self, fresh: Vec<LoadedKit>) {
+        let mut kits = self.kits.lock().await;
+        let mut seen = std::collections::HashSet::new();
+
+        for kit in fresh {
+            let name = kit.manifest.name.clone();
+            if !seen.insert(name.clone()) {
+                warn!(
+                    "Kit '{}' appears multiple times in manifest list, skipping duplicate",
+                    name
+                );
+                continue;
+            }
+
+            if let Some(state) = kits.get_mut(&name) {
+                let old_json = serde_json::to_string(&state.kit.manifest).unwrap_or_default();
+                let new_json = serde_json::to_string(&kit.manifest).unwrap_or_default();
+                if old_json != new_json {
+                    let old_version = state.kit.manifest.version.clone();
+                    let new_version = kit.manifest.version.clone();
+                    state.connect_gate = Arc::new(Mutex::new(()));
+                    state.kit.manifest = kit.manifest;
+                    state.kit.command = kit.command;
+                    state.kit.kit_dir = kit.kit_dir;
+                    drop_connection(state).await;
+                    state.failure_count = 0;
+                    state.unhealthy = false;
+                    state.last_failure_at = None;
+                    info!(
+                        "Kit '{}' manifest refreshed (v{} → v{})",
+                        name, old_version, new_version
+                    );
+                }
+            } else {
+                let version = kit.manifest.version.clone();
+                let pre_unhealthy = !command_binary_exists(&kit.command);
+                if pre_unhealthy {
+                    warn!(
+                        "Kit '{}' pre-marked unhealthy: command binary not found: {}",
+                        name,
+                        kit.command.first().map(|s| s.as_str()).unwrap_or("<empty>")
+                    );
+                }
+                kits.insert(
+                    name.clone(),
+                    KitState {
+                        connect_gate: Arc::new(Mutex::new(())),
+                        kit,
+                        connection: None,
+                        failure_count: 0,
+                        unhealthy: pre_unhealthy,
+                        last_failure_at: None,
+                        unsent_calls: 0,
+                    },
+                );
+                info!("Kit '{}' discovered (v{})", name, version);
+            }
+        }
+
+        let to_remove: Vec<String> = kits
+            .keys()
+            .filter(|name| !seen.contains(*name))
+            .cloned()
+            .collect();
+        for name in to_remove {
+            if let Some(mut state) = kits.remove(&name) {
+                drop_connection(&mut state).await;
+                info!("Kit '{}' removed", name);
+            }
+        }
+    }
+
+    /// Drain accumulated call counts per kit since the last drain, resetting
+    /// counters to zero. Only kits with count > 0 are included.
+    pub async fn drain_usage_counts(&self) -> HashMap<String, u64> {
+        let mut result = HashMap::new();
+        let mut kits = self.kits.lock().await;
+        for (name, state) in kits.iter_mut() {
+            let count = std::mem::take(&mut state.unsent_calls);
+            if count > 0 {
+                result.insert(name.clone(), count);
+            }
+        }
+        result
+    }
+}
+
+async fn ensure_connection_with_timeout(state: &mut KitState, timeout_secs: u64) -> Result<()> {
+    // Self-healing: an unhealthy kit gets another chance once the cooldown has
+    // elapsed, so a transient fault does not require a Portal restart.
+    recover_if_cooled_down(state);
+
+    if state.unhealthy {
+        anyhow::bail!(
+            "Kit '{}' is unhealthy. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+            state.kit.manifest.name,
+            format_command(&state.kit.command)
+        );
+    }
+
+    if state
+        .connection
+        .as_ref()
+        .map(|connection| connection.is_alive())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    drop_connection(state).await;
+
+    if state.failure_count >= MAX_FAILURES {
+        state.unhealthy = true;
+        anyhow::bail!(
+            "Kit '{}' is unhealthy after {} failed restart attempts. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+            state.kit.manifest.name,
+            state.failure_count,
+            format_command(&state.kit.command)
+        );
+    }
+
+    let kit_name = state.kit.manifest.name.clone();
+    let command = state.kit.command.clone();
+    let command_text = format_command(&command);
+
+    info!("Spawning kit '{}' with command: {}", kit_name, command_text);
+
+    let config = McpServerConfig {
+        name: kit_name.clone(),
+        command,
+        env: kit_env(state),
+        cwd: Some(state.kit.kit_dir.clone()),
+    };
+
+    match timeout(
+        Duration::from_secs(timeout_secs),
+        McpConnection::spawn(config),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => {
+            debug!("Kit '{}' spawned", kit_name);
+            state.connection = Some(Arc::new(connection));
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            record_failure(state);
+            let message = format!(
+                "Kit '{}' failed to start: {}. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+                kit_name, err, command_text
+            );
+            warn!("{}", message);
+            Err(anyhow::anyhow!("{}", message))
+        }
+        Err(_) => {
+            // A spawn timeout is treated like any other failure: increment the
+            // failure count and let the gradual MAX_FAILURES mechanism decide
+            // when to mark the kit unhealthy, rather than doing so immediately.
+            record_failure(state);
+            let message = format!(
+                "Kit '{}' failed to start: timed out after {} seconds. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+                kit_name,
+                timeout_secs,
+                command_text
+            );
+            warn!("{}", message);
+            Err(anyhow::anyhow!("{}", message))
+        }
+    }
+}
+
+/// Reset an unhealthy kit back to a retryable state once the recovery cooldown
+/// has elapsed since its last recorded failure.
+fn recover_if_cooled_down(state: &mut KitState) {
+    if !state.unhealthy {
+        return;
+    }
+
+    let cooled_down = state
+        .last_failure_at
+        .map(|at| at.elapsed() >= Duration::from_secs(RECOVERY_COOLDOWN_SECS))
+        .unwrap_or(false);
+
+    if cooled_down {
+        info!(
+            "Kit '{}' cooldown elapsed after {}s; giving it another chance",
+            state.kit.manifest.name, RECOVERY_COOLDOWN_SECS
+        );
+        state.unhealthy = false;
+        state.failure_count = 0;
+    }
+}
+
+/// Normalize kit name for tool routing: replace hyphens with underscores.
+fn kit_slug(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+fn push_kit_tools(state: &KitState, tools: &mut Vec<ToolInfo>) {
+    for tool in &state.kit.manifest.tools {
+        tools.push(ToolInfo {
+            name: format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name),
+            description: tool.description.clone(),
+            input_schema: tool.params.clone(),
+        });
+    }
+}
+
+async fn drop_connection(state: &mut KitState) {
+    // Dropping the final connection kills its managed child and aborts readers.
+    // Never wait for process or pipe IO while holding the manager's global lock.
+    state.connection.take();
+}
+
+fn record_failure(state: &mut KitState) {
+    state.failure_count = state.failure_count.saturating_add(1);
+    state.last_failure_at = Some(Instant::now());
+    if state.failure_count >= MAX_FAILURES {
+        state.unhealthy = true;
+        warn!(
+            "Kit '{}' marked unhealthy after {} failures",
+            state.kit.manifest.name, state.failure_count
+        );
+    }
+}
+
+fn kit_env(state: &KitState) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    env.insert(
+        "PORTAL_KIT_NAME".to_string(),
+        state.kit.manifest.name.clone(),
+    );
+    env.insert(
+        "PORTAL_KIT_DIR".to_string(),
+        state.kit.kit_dir.to_string_lossy().to_string(),
+    );
+    // On Unix, service managers often provide a minimal PATH, so prepend the
+    // common toolchain directories. On Windows, preserve the inherited PATH
+    // verbatim: its separator is `;` and command shims are resolved via
+    // PATHEXT (`codex` commonly maps to `codex.cmd`).
+    #[cfg(unix)]
+    let path = match std::env::var("PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{}", KIT_EXTRA_PATH, existing),
+        _ => KIT_EXTRA_PATH.to_string(),
+    };
+    #[cfg(not(unix))]
+    let path = std::env::var("PATH").unwrap_or_default();
+    env.insert("PATH".to_string(), path);
+    env
+}
+
+fn status_text(state: &KitState) -> &'static str {
+    if state.unhealthy {
+        "unhealthy"
+    } else if state
+        .connection
+        .as_ref()
+        .map(|connection| connection.is_alive())
+        .unwrap_or(false)
+    {
+        "healthy"
+    } else {
+        "not-started"
+    }
+}
+
+/// Best-effort coercion of string-typed act-DSL arguments to the types
+/// declared in a kit tool's JSON Schema `properties`. Parse failures leave
+/// the original value so the kit can report the real validation error.
+fn coerce_kit_arguments(arguments: &mut Value, schema: &Value) {
+    let Some(args_obj) = arguments.as_object_mut() else {
+        return;
+    };
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return;
+    };
+
+    for (key, prop_schema) in properties {
+        let Some(value) = args_obj.get_mut(key) else {
+            continue;
+        };
+        let Some(type_str) = prop_schema.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Value::String(s) = value else {
+            continue;
+        };
+
+        let coerced = match type_str {
+            "integer" => s.parse::<i64>().ok().map(Value::from),
+            "number" => s.parse::<f64>().ok().map(Value::from),
+            "boolean" => match s.as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            "array" => serde_json::from_str::<Value>(s)
+                .ok()
+                .filter(|v| v.is_array()),
+            _ => None,
+        };
+
+        if let Some(new_val) = coerced {
+            *value = new_val;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kits::manifest::{KitManifest, KitToolDef};
+
+    #[test]
+    fn kit_slug_normalizes_hyphens() {
+        assert_eq!(kit_slug("agent-reach"), "agent_reach");
+        assert_eq!(kit_slug("cua-driver"), "cua_driver");
+        assert_eq!(kit_slug("cursor"), "cursor");
+        assert_eq!(kit_slug("a-b-c"), "a_b_c");
+    }
+
+    #[tokio::test]
+    async fn resolve_tool_normalizes_kit_hyphens() {
+        let manager = KitManager::new(vec![loaded_kit("my-kit", None)]);
+        // Should resolve with underscored form
+        let result = manager.resolve_tool("my_kit_ping").await;
+        assert!(result.is_some(), "should resolve my_kit_ping");
+        let (kit_name, tool_name) = result.unwrap();
+        assert_eq!(
+            kit_name, "my-kit",
+            "should return original kit name for internal lookup"
+        );
+        assert_eq!(tool_name, "ping");
+        // Should also resolve with hyphenated form (backward compat)
+        let result2 = manager.resolve_tool("my-kit_ping").await;
+        assert!(
+            result2.is_some(),
+            "should resolve my-kit_ping (hyphen form)"
+        );
+        let (kit_name2, tool_name2) = result2.unwrap();
+        assert_eq!(kit_name2, "my-kit");
+        assert_eq!(tool_name2, "ping");
+    }
+
+    #[tokio::test]
+    async fn list_tools_uses_normalized_names() {
+        let manager = KitManager::new(vec![loaded_kit("my-kit", None)]);
+        let tools = manager.list_tools().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].name, "my_kit_ping",
+            "exposed tool name should use underscores"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_healthy_tools_skips_unhealthy_kits() {
+        // "broken" kit has a missing binary → pre-marked unhealthy by KitManager::new()
+        // "healthy" kit uses /bin/echo → not pre-marked
+        let manager = KitManager::new(vec![
+            loaded_kit("healthy", None),
+            loaded_kit("broken", None),
+        ]);
+
+        let all_tools = manager.list_tools().await;
+        let healthy_tools = manager.list_healthy_tools().await;
+
+        assert_eq!(all_tools.len(), 2);
+        assert_eq!(healthy_tools.len(), 1);
+        assert_eq!(healthy_tools[0].name, "healthy_ping");
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_unhealthy_and_non_eager_kits() {
+        // eager=true healthy, eager=false healthy, eager=true but unhealthy (missing binary)
+        let manager = KitManager::new(vec![
+            loaded_kit("eager-ok", Some(true)),
+            loaded_kit("not-eager", Some(false)),
+            loaded_kit("broken", Some(true)),
+        ]);
+
+        manager.warmup().await;
+
+        // Manager remains functional after warmup (failures are non-fatal).
+        let all_tools = manager.list_tools().await;
+        let healthy_tools = manager.list_healthy_tools().await;
+        assert_eq!(all_tools.len(), 3);
+        assert_eq!(healthy_tools.len(), 2);
+        let statuses = manager.statuses().await;
+        assert_eq!(statuses.len(), 3);
+    }
+
+    #[test]
+    fn unhealthy_kit_recovers_after_cooldown() {
+        let mut state = kit_state(loaded_kit("healthy", None));
+        state.unhealthy = true;
+        state.failure_count = MAX_FAILURES;
+        state.last_failure_at =
+            Instant::now().checked_sub(Duration::from_secs(RECOVERY_COOLDOWN_SECS + 1));
+        assert!(
+            state.last_failure_at.is_some(),
+            "test host must have enough uptime to construct a past Instant"
+        );
+
+        recover_if_cooled_down(&mut state);
+
+        assert!(
+            !state.unhealthy,
+            "an unhealthy kit should recover once the cooldown has elapsed"
+        );
+        assert_eq!(
+            state.failure_count, 0,
+            "recovery should reset failure_count"
+        );
+    }
+
+    #[test]
+    fn unhealthy_kit_stays_unhealthy_within_cooldown() {
+        let mut state = kit_state(loaded_kit("healthy", None));
+        state.unhealthy = true;
+        state.failure_count = MAX_FAILURES;
+        state.last_failure_at = Some(Instant::now());
+
+        recover_if_cooled_down(&mut state);
+
+        assert!(
+            state.unhealthy,
+            "a kit within its cooldown window must stay unhealthy"
+        );
+    }
+
+    #[test]
+    fn kit_env_includes_path() {
+        let state = kit_state(loaded_kit("healthy", None));
+
+        let env = kit_env(&state);
+
+        let path = env.get("PATH").expect("kit_env must set PATH");
+        #[cfg(unix)]
+        assert!(
+            path.contains("/opt/homebrew/bin"),
+            "PATH should include Homebrew's bin dir, got: {}",
+            path
+        );
+        #[cfg(unix)]
+        assert!(
+            path.contains("/usr/bin"),
+            "PATH should include /usr/bin, got: {}",
+            path
+        );
+        #[cfg(windows)]
+        assert_eq!(path, &std::env::var("PATH").unwrap_or_default());
+        assert_eq!(
+            env.get("PORTAL_KIT_NAME").map(String::as_str),
+            Some("healthy"),
+            "existing kit env vars must be preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_kit_start_does_not_block_status_or_another_kit() {
+        let mut slow = loaded_kit("slow", None);
+        slow.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let manager = KitManager::new(vec![slow, loaded_kit("healthy", None)]);
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move { task_manager.connection("slow", 30).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let statuses = timeout(Duration::from_millis(500), manager.statuses())
+            .await
+            .unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert!(timeout(
+            Duration::from_millis(500),
+            manager.resolve_tool("healthy_ping")
+        )
+        .await
+        .unwrap()
+        .is_some());
+        task.abort();
+        let _ = task.await;
+        manager.shutdown().await;
+    }
+
+    #[test]
+    fn coerce_string_to_integer() {
+        let mut args = serde_json::json!({"limit": "42"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], 42);
+    }
+
+    #[test]
+    fn coerce_string_to_number() {
+        let mut args = serde_json::json!({"ratio": "3.14"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ratio": {"type": "number"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["ratio"], 3.14);
+    }
+
+    #[test]
+    fn coerce_string_to_boolean() {
+        let mut args = serde_json::json!({"flag": "true", "other": "false"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "flag": {"type": "boolean"},
+                "other": {"type": "boolean"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["flag"], true);
+        assert_eq!(args["other"], false);
+    }
+
+    #[test]
+    fn coerce_leaves_unparseable_string_as_is() {
+        let mut args = serde_json::json!({"limit": "not-a-number", "flag": "yes"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "flag": {"type": "boolean"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], "not-a-number");
+        assert_eq!(args["flag"], "yes");
+    }
+
+    #[test]
+    fn coerce_passes_native_values_through() {
+        let mut args = serde_json::json!({"limit": 7, "flag": false, "ratio": 1.5});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "flag": {"type": "boolean"},
+                "ratio": {"type": "number"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], 7);
+        assert_eq!(args["flag"], false);
+        assert_eq!(args["ratio"], 1.5);
+    }
+
+    #[test]
+    fn coerce_ignores_args_missing_from_schema() {
+        let mut args = serde_json::json!({"limit": "3", "extra": "keep"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], 3);
+        assert_eq!(args["extra"], "keep");
+    }
+
+    #[test]
+    fn coerce_handles_empty_or_null_schema() {
+        let mut args = serde_json::json!({"limit": "3"});
+        coerce_kit_arguments(&mut args, &Value::Null);
+        assert_eq!(args["limit"], "3");
+
+        coerce_kit_arguments(&mut args, &serde_json::json!({}));
+        assert_eq!(args["limit"], "3");
+
+        coerce_kit_arguments(&mut args, &serde_json::json!({"type": "object"}));
+        assert_eq!(args["limit"], "3");
+    }
+
+    #[test]
+    fn coerce_string_to_array() {
+        let mut args = serde_json::json!({"tags": "[\"a\",\"b\"]"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["tags"], serde_json::json!(["a", "b"]));
+    }
+
+    fn kit_state(kit: LoadedKit) -> KitState {
+        KitState {
+            connect_gate: Arc::new(Mutex::new(())),
+            kit,
+            connection: None,
+            failure_count: 0,
+            unhealthy: false,
+            last_failure_at: None,
+            unsent_calls: 0,
+        }
+    }
+
+    fn loaded_kit(name: &str, eager: Option<bool>) -> LoadedKit {
+        // Use a short-lived real command so healthy kits work on every test OS.
+        let argv = if name == "broken" {
+            vec!["definitely-missing-kit-binary"]
+        } else {
+            #[cfg(windows)]
+            {
+                vec!["cmd.exe", "/D", "/C", "echo"]
+            }
+            #[cfg(not(windows))]
+            {
+                vec!["/bin/echo"]
+            }
+        };
+        loaded_kit_argv(name, argv, eager)
+    }
+
+    fn loaded_kit_argv(name: &str, argv: Vec<&str>, eager: Option<bool>) -> LoadedKit {
+        let command: Vec<String> = argv.into_iter().map(str::to_string).collect();
+        LoadedKit {
+            manifest: KitManifest {
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: None,
+                author: None,
+                platform: None,
+                runtime: None,
+                command: command.clone(),
+                tools: vec![KitToolDef {
+                    name: "ping".to_string(),
+                    description: "Ping".to_string(),
+                    params: serde_json::json!({"type": "object"}),
+                }],
+                permissions: None,
+                workspace: None,
+                eager,
+            },
+            kit_dir: std::env::temp_dir(),
+            command,
+        }
+    }
+}

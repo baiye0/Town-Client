@@ -1,0 +1,9 @@
+flowchart LR
+  B[Being] --> R[Relay]
+  R --> P[单个 Rust Portal]
+  O[现有守护 / 一个管理者] --> P
+  P --> G[进程内统一入口检查]
+  G --> W[统一命令管理 / MCP / kit]
+  G --> F[文件 / 网络 / 桌面工具]
+  P --> S[结构化状态]
+  U[现有升级事务 + 验证] --> P

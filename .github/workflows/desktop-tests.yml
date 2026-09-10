@@ -1,0 +1,104 @@
+name: Desktop and Portal tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      native_background:
+        description: '同时在专用已登录的 Mac runner（beings-test）测试真实后台服务'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Client + Rust Portal (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: client
+    env:
+      # Hosted runners do not guarantee an interactive login/session manager.
+      # Real launchd lifecycle remains enabled by default for local Mac runs.
+      BEINGS_TEST_BACKGROUND: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: client
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - name: Check Rust toolchain
+        run: rustup show
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Run complete suite
+        run: npm run test:all
+      - name: Build distributables
+        run: npm run make
+      - name: Upload platform distributables
+        uses: actions/upload-artifact@v4
+        with:
+          name: Beings-${{ matrix.os }}
+          path: client/out/make/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish test summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f test-results/summary.md ]; then
+            cat test-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload logs, JUnit, traces and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: client/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  native-background:
+    name: Native macOS login service lifecycle
+    if: github.event_name == 'workflow_dispatch' && inputs.native_background
+    runs-on: [self-hosted, macOS, beings-test]
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: client
+    env:
+      BEINGS_TEST_BACKGROUND: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: client
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - run: npm run test:all
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-native-macos
+          path: client/test-results/
+          retention-days: 14

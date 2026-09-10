@@ -1,0 +1,31 @@
+# Copy this file to portal.toml and adjust only machine-local settings.
+# portal.toml is intentionally Git-ignored.
+name = "portal"
+# Relative to this config file, not the shell's current directory.
+# Windows absolute path example: workspace = 'C:\Users\you\Portal Workspace'
+workspace = "./workspace"
+bind = "127.0.0.1:9100"
+kits_enabled = false
+
+# By default kits are loaded from ~/.heart-portal/kits, including
+# %USERPROFILE%/.heart-portal/kits on Windows.
+# kits_dir = "C:/Users/you/.heart-portal/kits"
+
+# Local TCP mode requires a random secret here or PORTAL_MCP_TOKEN.
+# Relay connect mode does not open TCP and uses the connection link instead.
+# portal_mcp_token = "replace-with-a-random-secret"
+
+# Opt in to execution/kits only for a trusted Being: these run as your user.
+[tools]
+exec = false
+file = true
+screenshot = false
+web_fetch = true
+search = true
+custom_tools_enabled = false
+
+[security]
+# An empty allowlist permits any command when exec=true. This is a convenience
+# filter, not a shell sandbox; interpreters can execute arbitrary user code.
+exec_allowlist = []
+max_file_size = 10485760

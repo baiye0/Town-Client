@@ -1,0 +1,108 @@
+// Exercise the packaged application's real IPC and net.fetch with intercepted HTTPS fixtures.
+import { _electron as electron } from 'playwright';
+import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
+import { c as archive } from 'tar';
+import path from 'node:path';
+import os from 'node:os';
+import assert from 'node:assert/strict';
+import { desktopExecutable } from './support/desktop.mjs';
+const executablePath = await desktopExecutable();
+const dir = await mkdtemp(path.join(os.tmpdir(), 'beings-town-ui-'));
+let app;
+try {
+  const remote = path.join(dir, 'remote-kit'); await mkdir(remote);
+  await writeFile(path.join(remote, 'manifest.json'), JSON.stringify({ name: 'downloaded-kit', version: '1.0', command: [process.execPath, 'server.mjs'], tools: [{ name: 'downloaded_ping', description: 'Downloaded tool' }], provision: { env: [{ name: 'FIXTURE_API_KEY', required: true }] } }));
+  await writeFile(path.join(remote, 'package.json'), JSON.stringify({ name: 'downloaded-kit', version: '1.0.0', private: true }));
+  await writeFile(path.join(remote, 'server.mjs'), `import readline from 'node:readline';
+if(process.env.FIXTURE_API_KEY!=='fixture-value')throw Error('missing config');
+readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id==null)return;const result=r.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}:{tools:[{name:'downloaded_ping',description:'Downloaded tool',inputSchema:{type:'object'}}]};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n');});`);
+  const bundle = path.join(dir, 'kit.tar.gz'); await archive({ gzip: true, cwd: remote, file: bundle }, ['manifest.json', 'package.json', 'server.mjs']);
+  app = await electron.launch({ executablePath, env: { ...process.env, BEINGS_USER_DATA: path.join(dir, 'profile') } });
+  const page = await app.firstWindow();
+  await app.context().tracing.start({ screenshots: true, snapshots: true });
+  const config = path.join(dir, 'portal.toml');
+  await writeFile(config, `workspace = ${JSON.stringify(dir)}\nkits_dir = ${JSON.stringify(path.join(dir, 'kits'))}\nkits_enabled = true\n`);
+  await page.evaluate(async ({ dir, config }) => {
+    const { settings } = await window.beings.snapshot();
+    await window.beings.save({ ...settings, connectionLink: 'http://127.0.0.1:1/willow/?token=local-ui-test', workspace: dir, portalConfigPath: config, backgroundEnabled: false, autoStart: false });
+  }, { dir, config });
+  const errors = []; page.on('pageerror', error => errors.push(error.message));
+  await app.evaluate(({ protocol }, bundle) => {
+    globalThis.townRequests = [];
+    protocol.handle('https', request => {
+      const url = new URL(request.url);
+      globalThis.townRequests.push({ path: url.pathname, query: url.search, authorization: request.headers.get('authorization') });
+      const json = (data, status = 200) => Response.json(data, { status });
+      if (url.pathname === '/api/grove/kit0/download') return new Response(Uint8Array.from(atob(bundle), c => c.charCodeAt(0)), { headers: { 'Content-Type': 'application/gzip' } });
+      const privateRoute = ['/api/bonfire/hear', '/api/messages', '/api/scrolls'].includes(url.pathname);
+      if (privateRoute && request.headers.get('authorization') !== 'Bearer town-fixture-token') return json({ error: 'missing credentials' }, 401);
+      if (url.pathname === '/api') return json({ version: '0.3.0', community: [{ being_id: 'willow', display_name: 'Willow' }], services: {
+        '🌳 grove': { what: 'Discover tools for your Being', help: 'GET /api/grove/help' }, '🔥 bonfire': { what: 'Gather around the fire', help: 'GET /api/bonfire/help' },
+        '📬 messages': { what: 'Private letters', help: 'GET /api/messages/help' }, '📚 ember': { what: 'Stories from the town', help: 'GET /api/embers/help' },
+      }, whats_new: [{ service: 'Kit', change: 'New tools', date: '2026-09-07' }] });
+      if (url.pathname === '/api/bonfire/hear') return json({ messages: [{ seq: 1, being: { display_name: 'Willow' }, message: '**篝火测试** <img src=x onerror="window.pwned=true">', at: '2026-09-07T12:00:00Z' }] });
+      if (url.pathname === '/api/messages') return json({ count: 1, messages: [{ id: '1', sender: url.searchParams.get('with') === 'sent' ? 'Willow' : 'River', recipient: url.searchParams.get('with') === 'sent' ? 'River' : 'Willow', content: url.searchParams.get('with') === 'sent' ? '已发送的测试信件' : '一封测试来信', delivery_status: 'delivered', created_at: '2026-09-07T12:00:00Z' }] });
+      if (url.pathname === '/api/grove') {
+        const offset = Number(url.searchParams.get('offset'));
+        return json({ count: 25, kits: Array.from({ length: offset ? 1 : 24 }, (_, i) => ({ id: 'kit' + (offset + i), name: 'Tool ' + (offset + i), description: 'A useful kit', display_name: 'Willow', version: '1.0', status: 'grown' })) });
+      }
+      if (url.pathname.startsWith('/api/grove/')) return json({ id: 'kit0', name: 'downloaded-kit', description: 'A useful kit', version: '1.0', has_bundle: true, manifest: { command: ['node', 'server.mjs'], tools: [{ name: 'test_tool', description: 'Test tool parameters', params: { type: 'object', properties: { query: { type: 'string' } } } }] } });
+      if (url.pathname === '/api/embers' || url.pathname === '/api/scrolls') return json({ total: 1, scrolls: [{ id: 'story1', title: '测试书架故事', display_name: 'Willow', kind: 'ember', updated_at: '2026-09-07T12:00:00Z' }] });
+      if (url.pathname.startsWith('/api/embers/') || url.pathname.startsWith('/api/scrolls/')) return json({ id: 'story1', title: '测试书架故事', display_name: 'Willow', content: '这是一段 **完整内容**。<script>window.pwned=true</script>', has_more: false });
+      return json({ error: 'not found' }, 404);
+    });
+  }, (await readFile(bundle)).toString('base64'));
+  const nav = async name => { await page.locator(`nav [data-view="${name}"]`).click(); await page.waitForFunction(() => !document.querySelector('#town-body').hasAttribute('aria-busy')); };
+  await nav('town'); await page.getByText('4 项服务').waitFor();
+  await page.getByRole('tab', { name: '居民', exact: true }).click(); await page.locator('.resident-card').waitFor();
+  await page.getByRole('tab', { name: '最近更新' }).click(); await page.getByText('New tools').waitFor();
+  await nav('mail'); await page.getByRole('heading', { name: '连接 Town，继续阅读' }).waitFor();
+  await page.getByRole('button', { name: '配置 Town 连接' }).click();
+  await page.locator('.town-advanced-auth summary').click();
+  await page.locator('#town-token').fill('town-fixture-token'); await page.getByRole('button', { name: '保存已有凭据' }).click();
+  await page.getByText('一封测试来信').waitFor(); await page.getByRole('tab', { name: '已发送', exact: true }).click(); await page.getByText('已发送的测试信件').waitFor();
+  await nav('bonfire'); await page.getByText('篝火测试', { exact: true }).waitFor(); assert.equal(await page.evaluate(() => window.pwned), undefined);
+  await nav('kits'); await page.locator('.catalog-item').first().click(); await page.getByText('test_tool', { exact: true }).waitFor();
+  await page.locator('.tool-item summary').click(); await page.getByText('"query":', { exact: false }).waitFor();
+  await page.getByRole('button', { name: '下一页 →' }).click(); await page.getByText('第 2 页 · 共 25 项').waitFor(); assert.equal(await page.locator('.catalog-item').count(), 1);
+  await page.locator('#town-search').fill('does-not-exist'); await page.getByText('当前页没有符合条件的内容。').waitFor();
+  await page.getByRole('tab', { name: '本机 Kits', exact: true }).click(); await page.getByText('给 Being 添一件工具').waitFor();
+  await nav('embers'); await page.locator('.catalog-item').first().click(); await page.getByText('完整内容', { exact: true }).waitFor(); assert.equal(await page.evaluate(() => window.pwned), undefined);
+  await nav('kits'); await page.getByRole('tab', { name: 'Grove 市集', exact: true }).click();
+  await page.locator('.catalog-item').first().click(); await page.getByRole('button', { name: '安装到本机', exact: true }).click();
+  await page.getByRole('heading', { name: '安装 downloaded-kit', exact: true }).waitFor();
+  await page.locator('#kit-env-FIXTURE_API_KEY').fill('fixture-value');
+  await mkdir('test-results', { recursive: true }); await page.screenshot({ path: 'test-results/kit-install.png' });
+  await page.getByRole('button', { name: '安装并检查工具', exact: true }).click();
+  await page.locator('.catalog-item').filter({ hasText: 'downloaded-kit' }).waitFor({ timeout: 60000 });
+  const downloaded = JSON.parse(await readFile(path.join(dir, 'kits/downloaded-kit/manifest.json'), 'utf8'));
+  assert.equal(downloaded.tools[0].name, 'downloaded_ping');
+  assert(!JSON.stringify(downloaded).includes('fixture-value'));
+  assert.equal(await page.locator('#kit-env-FIXTURE_API_KEY').count(), 0);
+  // Real importer: native chooser and confirmation are mocked only inside the test process.
+  const source = path.join(dir, 'test-kit'); await mkdir(source);
+  await writeFile(path.join(source, 'manifest.json'), JSON.stringify({ name: 'desktop-test-kit', version: '1.0', command: ['node', 'server.mjs'], tools: [{ name: 'fixture_tool', description: 'Fixture tool', params: { type: 'object' } }] }));
+  await writeFile(path.join(source, 'server.mjs'), 'throw new Error("must not execute on import");');
+  await app.evaluate(({ dialog }, source) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [source] }); dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false }); }, source);
+  await nav('kits'); await page.getByRole('tab', { name: '本机 Kits', exact: true }).click();
+  await page.getByRole('button', { name: '导入本地 Kit', exact: true }).click(); await page.locator('.catalog-item').filter({ hasText: 'desktop-test-kit' }).click(); await page.getByText('fixture_tool', { exact: true }).waitFor();
+  await mkdir('test-results', { recursive: true }); await page.screenshot({ path: 'test-results/kits.png' });
+  const requests = await app.evaluate(() => globalThis.townRequests);
+  assert(requests.filter(r => ['/api', '/api/grove', '/api/embers'].includes(r.path)).every(r => r.authorization === null));
+  assert(requests.some(r => r.path === '/api/messages' && r.authorization === 'Bearer town-fixture-token'));
+  assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), 'rgba(0, 0, 0, 0)');
+  // Electron's getBackgroundColor() omits alpha; renderer transparency is asserted above.
+  assert.deepEqual(errors, []); console.log('Town UI passed: native material, real IPC, auth, mail folders, markdown, pagination, Kit import and tool schemas.');
+} catch (error) {
+  await mkdir('test-results', { recursive: true });
+  await app?.windows()[0]?.screenshot({ path: 'test-results/town-failure.png' }).catch(() => {});
+  throw error;
+} finally {
+  try {
+    if (app) {
+      await mkdir('test-results', { recursive: true });
+      await app.context().tracing.stop({ path: 'test-results/town-trace.zip' }).catch(() => {});
+      await app.close();
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+}

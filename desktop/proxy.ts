@@ -1,0 +1,71 @@
+import type { Connection } from './connection';
+
+const routes: Record<string, string[]> = {
+  '/health': ['GET'], '/api/status': ['GET'], '/api/history': ['GET'],
+  '/api/stream/active': ['GET'], '/api/chat/stream': ['POST'], '/api/stop': ['POST'],
+  '/api/llm/config': ['GET', 'PATCH'], '/api/llm/oauth/start': ['POST'],
+  '/api/llm/oauth/poll': ['GET'], '/api/llm/oauth': ['DELETE'],
+};
+export function upstreamRequest(request: Request, connection: Connection) {
+  const local = new URL(request.url);
+  if (local.protocol !== 'beings:' || local.hostname !== 'chat' || !routes[local.pathname]?.includes(request.method)) {
+    throw new Error('API route not allowed');
+  }
+  const url = new URL(connection.endpoint + local.pathname);
+  for (const key of ['limit', 'after']) {
+    const value = local.searchParams.get(key);
+    if (value !== null && /^\d{1,16}$/.test(value)) url.searchParams.set(key, value);
+  }
+  url.searchParams.set('token', connection.token);
+  const headers = new Headers();
+  if (request.headers.has('content-type')) headers.set('content-type', request.headers.get('content-type')!);
+  headers.set('accept', request.headers.get('accept') || '*/*');
+  if (local.pathname.startsWith('/api/llm/')) headers.set('X-Relay-Secret', connection.relaySecret);
+  return { url: url.href, headers };
+}
+
+export class ChatProxy {
+  private requests = new Set<AbortController>();
+  constructor(private getConnection: () => Connection | null, private fetchUpstream: typeof fetch) {}
+  abortAll() { for (const controller of this.requests) controller.abort(); this.requests.clear(); }
+  async handle(request: Request): Promise<Response> {
+    const connection = this.getConnection();
+    if (!connection) return Response.json({ error: '请先连接 Being。' }, { status: 401 });
+    let upstream: ReturnType<typeof upstreamRequest>;
+    try { upstream = upstreamRequest(request, connection); }
+    catch { return new Response('Not found', { status: 404 }); }
+    const controller = new AbortController();
+    this.requests.add(controller);
+    const abort = () => controller.abort();
+    request.signal.addEventListener('abort', abort, { once: true });
+    if (request.signal.aborted) abort();
+    const cleanup = () => { this.requests.delete(controller); request.signal.removeEventListener('abort', abort); };
+    // Header timeout only. Long-running chat streams must remain open.
+    const timeout = setTimeout(abort, 30_000);
+    try {
+      const response = await this.fetchUpstream(upstream.url, {
+        method: request.method, headers: upstream.headers, redirect: 'error', credentials: 'omit',
+        body: ['POST', 'PATCH'].includes(request.method) ? await request.arrayBuffer() : undefined,
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      const headers = new Headers({ 'Cache-Control': 'no-store', 'Content-Type': response.headers.get('content-type') || 'application/json' });
+      if (!response.body || response.status === 204 || response.status === 304) {
+        cleanup(); return new Response(null, { status: response.status, headers });
+      }
+      const reader = response.body.getReader();
+      return new Response(new ReadableStream({
+        async pull(stream) {
+          try {
+            const result = await reader.read();
+            if (result.done) { cleanup(); stream.close(); } else stream.enqueue(result.value);
+          } catch (error) { cleanup(); stream.error(error); }
+        },
+        async cancel() { controller.abort(); cleanup(); await reader.cancel().catch(() => {}); },
+      }), { status: response.status, headers });
+    } catch {
+      clearTimeout(timeout); cleanup();
+      return Response.json({ error: '无法连接 Being，请检查网络、地址或凭据。' }, { status: 502 });
+    }
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+.vite/
+desktop/renderer/.vite/
+out/
+desktop/generated/
+resources/heart-portal*
+!resources/HEART-PORTAL-LICENSE
+.DS_Store
+*.log
+test-results/
+.env*

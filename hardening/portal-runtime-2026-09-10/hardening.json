@@ -1,0 +1,790 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "portal-runtime-2026-09-10",
+  "sourceEvidence": {
+    "kind": "source_collection",
+    "label": "Portal 2dab52f 与当前桌面集成源码",
+    "collectionSha256": "ce4acda44fa727c9c742a44bbe6bd162eb4c4e663846541dcaf8c91debc9995b",
+    "artifactCount": 29,
+    "targetRevision": "2dab52fc081d80a7bda9ce7735ab50c6cc6726ac",
+    "outerRepositoryRevision": "5d347107326fd754fafea1c1dc373a42986ff49f",
+    "sourceDrift": "present",
+    "sourceDriftDetail": "Portal clean at target revision; outer repository has user working changes captured by file hashes."
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "按社区维护优先选择单个 Rust Portal 的局部补强；不默认增加常驻组件、数据库或权限平台。尚未实现。"
+  },
+  "constraints": {
+    "profile": "community-minimal",
+    "changeHorizons": [
+      "incremental"
+    ],
+    "nonNegotiables": [
+      "精简、稳定、安全优先",
+      "保留用户修改",
+      "不默认新增运行组件/数据库/权限平台",
+      "不把任意 shell 宣传成沙箱"
+    ],
+    "assumptions": [
+      "登录用户模式",
+      "保留现有 Rust 核心/配置/守护/协议",
+      "跨重启结果恢复与无人值守当前不承诺"
+    ]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "portal-runtime",
+      "title": "用少量共用边界保证调用可控、故障可恢复",
+      "summary": "集中执行管理、入口检查与结构化状态，保留现有部署。",
+      "diagnosis": "当前请求处理、内存任务、同用户执行与多个平台管理入口的边界不足以表达可恢复任务及能力隔离。",
+      "evidence": [
+        {
+          "evidenceId": "E01",
+          "title": "连接和请求耦合",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/relay_client.rs",
+          "claim": "连接和请求耦合的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E02",
+          "title": "同步执行生命周期",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/tools/exec.rs",
+          "claim": "同步执行生命周期的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E03",
+          "title": "内存任务及回调",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/process_manager.rs",
+          "claim": "内存任务及回调的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E04",
+          "title": "当前用户执行边界",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal.example.toml",
+          "claim": "当前用户执行边界的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E05",
+          "title": "文件与网络工具边界",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/tools/file.rs",
+          "claim": "文件与网络工具边界的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E06",
+          "title": "守护与实例所有权",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/single_instance.rs",
+          "claim": "守护与实例所有权的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E07",
+          "title": "升级信任及恢复",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/upgrade.rs",
+          "claim": "升级信任及恢复的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E08",
+          "title": "状态与权限",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/connection_status.rs",
+          "claim": "状态与权限的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E09",
+          "title": "kit 自恢复",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/portal/src/kits/manager.rs",
+          "claim": "kit 自恢复的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        },
+        {
+          "evidenceId": "E10",
+          "title": "验证覆盖与文档",
+          "claimType": "observed",
+          "sourceKind": "source",
+          "path": "heart-portal/.github/workflows/test.yml",
+          "claim": "验证覆盖与文档的已观察结构及独立标记的推论见 proposal Evidence 表。"
+        }
+      ],
+      "desiredInvariants": [
+        "所有执行入口遵守用户配置",
+        "超时取消有界终止与回收",
+        "资源读取时限额",
+        "按故障范围恢复",
+        "未知副作用不盲重试",
+        "唯一生命周期 manager",
+        "更新执行前验证真实性"
+      ],
+      "proposalPath": "proposals/portal-runtime.md",
+      "options": [
+        {
+          "optionId": "local-guards",
+          "title": "方案 1：单进程补强（采用）",
+          "kind": "baseline",
+          "summary": "保留单个 Rust 核心和现有守护，集中执行/入口/状态的小范围修复。",
+          "diagramPaths": {
+            "before": "diagrams/portal-runtime-before.mmd",
+            "after": "diagrams/portal-runtime-local-guards-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E01",
+              "title": "连接和请求耦合",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E02",
+              "title": "同步执行生命周期",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E03",
+              "title": "内存任务及回调",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E04",
+              "title": "当前用户执行边界",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E05",
+              "title": "文件与网络工具边界",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E06",
+              "title": "守护与实例所有权",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E07",
+              "title": "升级信任及恢复",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E08",
+              "title": "状态与权限",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E09",
+              "title": "kit 自恢复",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E10",
+              "title": "验证覆盖与文档",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "统一入口与资源限制，同用户 trusted shell 权限保留",
+              "validationPlan": "入口禁用/插件保留名/最终资源拒绝测试"
+            },
+            {
+              "dimension": "performance",
+              "direction": "unknown",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "无新增 IPC/数据库，限额和调度开销待测",
+              "validationPlan": "相同短命令和 kit 调用延迟比较"
+            },
+            {
+              "dimension": "memory",
+              "direction": "unknown",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "流式限额减少无界峰值，有界调度成本待测",
+              "validationPlan": "大输出与长时间运行的内存/句柄增长"
+            },
+            {
+              "dimension": "reliability",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "修明确故障并分级恢复；核心共享进程风险保留",
+              "validationPlan": "断网、睡眠、强杀、kit 卡死、升级中断"
+            },
+            {
+              "dimension": "operability",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "沿用现有守护和配置，统一状态",
+              "validationPlan": "干净机器安装、status、停止与升级诊断"
+            },
+            {
+              "dimension": "migration",
+              "direction": "neutral",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "小 PR 渐进，保留协议，不默认引入新身份/数据模型",
+              "validationPlan": "旧配置、协议、安装和升级回退"
+            },
+            {
+              "dimension": "ergonomics",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "三个普通模块的共用边界，减少重复逻辑",
+              "validationPlan": "贡献者实现一个工具并运行针对性测试"
+            },
+            {
+              "dimension": "rollback",
+              "direction": "neutral",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "保留配置和已签名旧版本，无新增任务库格式迁移",
+              "validationPlan": "升级失败保留旧版本与配置"
+            }
+          ],
+          "residualRisks": [
+            "同用户任意代码仍有用户权限",
+            "响应丢失时操作结果可能未知",
+            "持久结果恢复不属于当前方案",
+            "睡眠/注销/权限撤销有明确可用边界"
+          ],
+          "status": "recommended"
+        },
+        {
+          "optionId": "agent-executors",
+          "title": "方案 2：控制代理与独立执行器（暂缓）",
+          "kind": "structural",
+          "summary": "有实际跨进程隔离需求时才评估，增加 IPC 和版本契约。",
+          "diagramPaths": {
+            "before": "diagrams/portal-runtime-before.mmd",
+            "after": "diagrams/portal-runtime-agent-executors-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E01",
+              "title": "连接和请求耦合",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E02",
+              "title": "同步执行生命周期",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E03",
+              "title": "内存任务及回调",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E04",
+              "title": "当前用户执行边界",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E05",
+              "title": "文件与网络工具边界",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E06",
+              "title": "守护与实例所有权",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E07",
+              "title": "升级信任及恢复",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E08",
+              "title": "状态与权限",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E09",
+              "title": "kit 自恢复",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E10",
+              "title": "验证覆盖与文档",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "集中能力检查和故障边界；强隔离取决于执行主体",
+              "validationPlan": "入口禁用/插件保留名/最终资源拒绝测试"
+            },
+            {
+              "dimension": "performance",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "增加 IPC 与状态传输",
+              "validationPlan": "相同短命令和 kit 调用延迟比较"
+            },
+            {
+              "dimension": "memory",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "原生 host 和 worker 增加常驻",
+              "validationPlan": "大输出与长时间运行的内存/句柄增长"
+            },
+            {
+              "dimension": "reliability",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "分级恢复清楚，IPC和存储引入新故障点",
+              "validationPlan": "断网、睡眠、强杀、kit 卡死、升级中断"
+            },
+            {
+              "dimension": "operability",
+              "direction": "unknown",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "统一状态但原生安装与签名维护增加",
+              "validationPlan": "干净机器安装、status、停止与升级诊断"
+            },
+            {
+              "dimension": "migration",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "IPC、安装及权限迁移",
+              "validationPlan": "旧配置、协议、安装和升级回退"
+            },
+            {
+              "dimension": "ergonomics",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "统一接入点和权限声明",
+              "validationPlan": "贡献者实现一个工具并运行针对性测试"
+            },
+            {
+              "dimension": "rollback",
+              "direction": "unknown",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "二进制可回退，数据库需保持任务连续性",
+              "validationPlan": "升级失败保留旧版本与配置"
+            }
+          ],
+          "residualRisks": [
+            "同用户任意代码仍有用户权限",
+            "响应丢失时操作结果可能未知",
+            "持久结果恢复不属于当前方案",
+            "睡眠/注销/权限撤销有明确可用边界"
+          ],
+          "status": "deferred"
+        },
+        {
+          "optionId": "isolated-vm",
+          "title": "方案 3：隔离虚拟机执行（不在当前范围）",
+          "kind": "isolation",
+          "summary": "仅未来不可信代码托管才评估，不预建执行后端。",
+          "diagramPaths": {
+            "before": "diagrams/portal-runtime-before.mmd",
+            "after": "diagrams/portal-runtime-isolated-vm-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E01",
+              "title": "连接和请求耦合",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E02",
+              "title": "同步执行生命周期",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E03",
+              "title": "内存任务及回调",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E04",
+              "title": "当前用户执行边界",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E05",
+              "title": "文件与网络工具边界",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E06",
+              "title": "守护与实例所有权",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E07",
+              "title": "升级信任及恢复",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E08",
+              "title": "状态与权限",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E09",
+              "title": "kit 自恢复",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            },
+            {
+              "evidenceId": "E10",
+              "title": "验证覆盖与文档",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "见精简方案的覆盖表；架构拆分本身不解决持久结果或已授权代码风险。"
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "analogous",
+              "assessment": "虚拟机降低任意代码对宿主的影响，桥接仍是边界",
+              "validationPlan": "入口禁用/插件保留名/最终资源拒绝测试"
+            },
+            {
+              "dimension": "performance",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "增加 guest 冷启动和共享 IO",
+              "validationPlan": "相同短命令和 kit 调用延迟比较"
+            },
+            {
+              "dimension": "memory",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "analogous",
+              "assessment": "guest 与镜像缓存增加成本",
+              "validationPlan": "大输出与长时间运行的内存/句柄增长"
+            },
+            {
+              "dimension": "reliability",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "污染可重建，同时需维护虚拟化依赖",
+              "validationPlan": "断网、睡眠、强杀、kit 卡死、升级中断"
+            },
+            {
+              "dimension": "operability",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "analogous",
+              "assessment": "需镜像、容量及宿主桥接运维",
+              "validationPlan": "干净机器安装、status、停止与升级诊断"
+            },
+            {
+              "dimension": "migration",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "另需工具兼容和数据共享迁移",
+              "validationPlan": "旧配置、协议、安装和升级回退"
+            },
+            {
+              "dimension": "ergonomics",
+              "direction": "regresses",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "开发者需要定义 guest 依赖与共享资源",
+              "validationPlan": "贡献者实现一个工具并运行针对性测试"
+            },
+            {
+              "dimension": "rollback",
+              "direction": "unknown",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "可禁用后端，不能自动退回宿主执行",
+              "validationPlan": "升级失败保留旧版本与配置"
+            }
+          ],
+          "residualRisks": [
+            "同用户任意代码仍有用户权限",
+            "响应丢失时操作结果可能未知",
+            "持久结果恢复不属于当前方案",
+            "睡眠/注销/权限撤销有明确可用边界"
+          ],
+          "status": "deferred"
+        }
+      ],
+      "recommendedOptionId": "local-guards",
+      "recommendation": "选择方案 1；多进程控制代理与虚拟机不进入默认路线图。"
+    }
+  ],
+  "openQuestions": [
+    "仅当确有跨重启结果恢复、注销后运行或不可信代码托管需求时重新评估。"
+  ],
+  "evidenceInventory": [
+    {
+      "evidenceId": "E01",
+      "title": "连接和请求耦合",
+      "path": "heart-portal/portal/src/relay_client.rs",
+      "sha256": "00fdbc5b15fe8da8ac699a093f448ec1331d32d1340d482db8c87023048d21fd"
+    },
+    {
+      "evidenceId": "E01",
+      "title": "连接和请求耦合",
+      "path": "heart-portal/portal/src/main.rs",
+      "sha256": "a69ffdb6c9a1454707cc694858f613b5fa19dda1e467e356f3f1d25db616eb92"
+    },
+    {
+      "evidenceId": "E02",
+      "title": "同步执行生命周期",
+      "path": "heart-portal/portal/src/tools/exec.rs",
+      "sha256": "2d8ddb6c2635d93d4d38c1f864fefb803a882470eac69a7a14ebc19ab85fd9e2"
+    },
+    {
+      "evidenceId": "E02",
+      "title": "同步执行生命周期",
+      "path": "heart-portal/portal/src/exec_policy.rs",
+      "sha256": "9f0b6ff7669ad8354a3eccb5bb89d5a1537e2cf24c61ddda68ac9dfe6fdd12cc"
+    },
+    {
+      "evidenceId": "E03",
+      "title": "内存任务及回调",
+      "path": "heart-portal/portal/src/process_manager.rs",
+      "sha256": "a3e2016bc26806ce9632726a03a3f0c5a52052b851a53fa98c29baa7f5d1f54e"
+    },
+    {
+      "evidenceId": "E04",
+      "title": "当前用户执行边界",
+      "path": "heart-portal/portal.example.toml",
+      "sha256": "60714de1b94d433bda8b88d2ca799fc062c2f84b5490be9fe5039ba86f7fdf41"
+    },
+    {
+      "evidenceId": "E04",
+      "title": "当前用户执行边界",
+      "path": "heart-portal/portal/src/tools/custom.rs",
+      "sha256": "3545530fe496c9e31a100815e9ed174219f98186268aa8dc5361f02d1131701d"
+    },
+    {
+      "evidenceId": "E04",
+      "title": "当前用户执行边界",
+      "path": "heart-portal/portal/src/tools/mod.rs",
+      "sha256": "7b9947c108979c96c0f780e94b18f6ced94b7240933e7d08bea4407c3d4bf715"
+    },
+    {
+      "evidenceId": "E05",
+      "title": "文件与网络工具边界",
+      "path": "heart-portal/portal/src/tools/file.rs",
+      "sha256": "3dbda13b785e389a33cb3556a89782f9f0bbd770a61fc40220f8de9cb55dd0d1"
+    },
+    {
+      "evidenceId": "E05",
+      "title": "文件与网络工具边界",
+      "path": "heart-portal/portal/src/tools/web.rs",
+      "sha256": "bee1daec622552806e1fdf0daf4af4408b5ac5396b96bdf52234ac6d7ca079f3"
+    },
+    {
+      "evidenceId": "E06",
+      "title": "守护与实例所有权",
+      "path": "heart-portal/portal/src/single_instance.rs",
+      "sha256": "5ff196d2797a8ad7b7a8f3b7c5469cc98dde5c16d089b39f40b44ee59eceff35"
+    },
+    {
+      "evidenceId": "E06",
+      "title": "守护与实例所有权",
+      "path": "heart-portal/portal/src/macos_supervisor.rs",
+      "sha256": "aaa9bb03bfabdf3448a663dc3d1daec428c741802261bf317abdeb74b5bf9045"
+    },
+    {
+      "evidenceId": "E06",
+      "title": "守护与实例所有权",
+      "path": "heart-portal/scripts/install-portal-task.ps1",
+      "sha256": "90997b66ccbe53b9c69cead2c96e822cd82cfd9c5ac1cb05586fd6f3518b2540"
+    },
+    {
+      "evidenceId": "E06",
+      "title": "守护与实例所有权",
+      "path": "desktop/portal.ts",
+      "sha256": "93164772d00c037db3319048d34f9ee4a67fc9bcb98ae015df18bfca8c9176c2"
+    },
+    {
+      "evidenceId": "E06",
+      "title": "守护与实例所有权",
+      "path": "desktop/external-portal.ts",
+      "sha256": "ad5eff18cb6c73a58f9cdecbb6bd669f5a574e20891c3772a06de7b5c1b410b8"
+    },
+    {
+      "evidenceId": "E07",
+      "title": "升级信任及恢复",
+      "path": "heart-portal/portal/src/upgrade.rs",
+      "sha256": "02261785a3e1795a2daabb8bc72ca2627f6aa136f28a089caa89f5b9588ba146"
+    },
+    {
+      "evidenceId": "E07",
+      "title": "升级信任及恢复",
+      "path": "heart-portal/portal/src/windows_upgrade.rs",
+      "sha256": "358569cba537d43dc400791b10cf474e47b2e86680463785245a7f1b6787a049"
+    },
+    {
+      "evidenceId": "E07",
+      "title": "升级信任及恢复",
+      "path": "heart-portal/portal/src/macos_upgrade.rs",
+      "sha256": "44e61af2f3cffbcc98930c0bcbf52d83dfa463cad3c396e9dd9501c2f700c2e1"
+    },
+    {
+      "evidenceId": "E07",
+      "title": "升级信任及恢复",
+      "path": "heart-portal/scripts/portal-macos-upgrade.py",
+      "sha256": "da4482c1b1dd762e0a405aee2f097fe4b4d07c3db92d40dca9dec833574c9b9f"
+    },
+    {
+      "evidenceId": "E07",
+      "title": "升级信任及恢复",
+      "path": "heart-portal/scripts/portal-lifecycle.ps1",
+      "sha256": "e1b1a5126cb545081e243bd9080b27085fd985da2a035cbefe6c8ea9dc40f21a"
+    },
+    {
+      "evidenceId": "E07",
+      "title": "升级信任及恢复",
+      "path": "heart-portal/portal/src/windows_private.rs",
+      "sha256": "2e83aadb60c979d85cd42f8c1ba17986dc993c4d001e5ef3229b3e8986c4df13"
+    },
+    {
+      "evidenceId": "E08",
+      "title": "状态与权限",
+      "path": "heart-portal/portal/src/connection_status.rs",
+      "sha256": "9e9e7eb288aecaeb7572302f5b777fd680bc90425795b0ddaf8437f717481b9f"
+    },
+    {
+      "evidenceId": "E08",
+      "title": "状态与权限",
+      "path": "heart-portal/portal/src/tools/permissions.rs",
+      "sha256": "35be4e8f108c4f8c07a9b531a73cf79553c3138f06386a92b211d5fdcdd5cd2b"
+    },
+    {
+      "evidenceId": "E09",
+      "title": "kit 自恢复",
+      "path": "heart-portal/portal/src/kits/manager.rs",
+      "sha256": "5f0e7bf1cd19970da65fb916a773210b5b4dc17dc201a860b26bd06bfb607102"
+    },
+    {
+      "evidenceId": "E09",
+      "title": "kit 自恢复",
+      "path": "heart-portal/portal/src/mcp/connection.rs",
+      "sha256": "0d4d44d804a5018579469f47d0877b960cd103ea72a798f708ba074973c6eb96"
+    },
+    {
+      "evidenceId": "E10",
+      "title": "验证覆盖与文档",
+      "path": "heart-portal/.github/workflows/test.yml",
+      "sha256": "8895d0b89f4b703bc6c49aa95b32d2ac541a364234586e66fbe875ea3bad4f53"
+    },
+    {
+      "evidenceId": "E10",
+      "title": "验证覆盖与文档",
+      "path": "heart-portal/SECURITY.md",
+      "sha256": "1eac3ccab726949473e4a321c2fa8df4cf4624ba6bc926d6c77aaa605062ea54"
+    },
+    {
+      "evidenceId": "E10",
+      "title": "验证覆盖与文档",
+      "path": "heart-portal/README.md",
+      "sha256": "20bbda706f0d02e19c7078a0edd8ae2c8b538905e57af8ed21f72f186aeb32d5"
+    },
+    {
+      "evidenceId": "E10",
+      "title": "验证覆盖与文档",
+      "path": "heart-portal/Cargo.lock",
+      "sha256": "a184e276b65a8fb20b09e6819b3744de7729311a6284b1c8b1512fb9745e32e4"
+    }
+  ],
+  "validation": {
+    "type": "artifact_integrity_and_static_source_review",
+    "runtimeTestsExecuted": false,
+    "crossPlatformCertification": false
+  },
+  "designRevision": "2-community-minimal"
+}
