@@ -48,7 +48,7 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
   } finally {
     await background.disable();
     if (process.platform === 'win32') {
-      const script = `Unregister-ScheduledTask -TaskName '${background.label}' -Confirm:$false`;
+      const script = `Get-ScheduledTask -TaskName '${background.label}' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false`;
       await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
     }
     await rm(root, { recursive: true, force: true });
