@@ -17,9 +17,12 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || process.platform !== 
     const encrypted = await readFile(path.join(background.installedService!.root, 'connection.dpapi'), 'utf8');
     expect(encrypted).not.toContain('registration-fixture');
     expect(encrypted.length).toBeGreaterThan(40);
+  } catch (error) {
+    console.error('Native Windows/macOS operation failed:', error);
+    throw error;
   } finally {
     await background.disable();
-    const script = `Get-ScheduledTask -TaskName '${background.label}' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false`;
+    const script = `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
     await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
     await rm(root, { recursive: true, force: true });
   }
