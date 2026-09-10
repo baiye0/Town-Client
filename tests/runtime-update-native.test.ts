@@ -1,8 +1,10 @@
 import { expect, it } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile, copyFile, chmod } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, copyFile, chmod, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:net';
+import { spawn } from 'node:child_process';
+import { ExternalPortalObserver } from '../desktop/external-portal';
 import { BackgroundPortal, command, windowsModulePath } from '../desktop/background';
 import { RuntimeUpdater, digest, type RuntimeBundle } from '../desktop/runtime-update';
 import { parseConnection } from '../desktop/connection';
@@ -58,3 +60,53 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
   }
 // Includes a deliberate 25 s startup failure plus real OS stop/start commands.
 }, 120_000);
+
+it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('takes over an independent Portal and supervisor after a manual client upgrade', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'town-manual-upgrade-'));
+  const directory = path.join(root, 'profile');
+  const background = new BackgroundPortal(directory);
+  const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
+  const oldRoot = path.join(root, 'old runtime with spaces');
+  const { mkdir } = await import('node:fs/promises'); await mkdir(oldRoot);
+  const oldBinary = path.join(oldRoot, path.basename(binary)); await copyFile(binary, oldBinary); await chmod(oldBinary, 0o700);
+  const configPath = path.join(oldRoot, 'custom config.toml');
+  const settings: Settings = { endpoint: '', being: '', hasToken: true, portalName: 'manual-upgrade', portalBinary: binary, workspace: oldRoot, autoStart: true, backgroundEnabled: true, allowExec: false, kitsEnabled: false };
+  const { portalConfig } = await import('../desktop/portal');
+  const original = portalConfig(settings) + '\n# exact original configuration\n'; await writeFile(configPath, original);
+  const connection = parseConnection(`http://127.0.0.1:1/test-${path.basename(root)}/?token=manual-upgrade-fixture`);
+  const observer = new ExternalPortalObserver();
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    child = spawn(oldBinary, ['--config', configPath, '--name', settings.portalName], { cwd: oldRoot, stdio: 'ignore',
+      env: { ...process.env, PORTAL_CONNECT_LINK: connection.link, HEART_PORTAL_SUPERVISED: undefined,
+        ...(process.platform === 'win32' ? { PSModulePath: path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/Modules') } : {}) } });
+    const deadline = Date.now() + 60_000;
+    let external = [] as Awaited<ReturnType<typeof observer.forUpgrade>>;
+    while (!external.length && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      external = await observer.forUpgrade(connection, background.label);
+    }
+    expect(external).toHaveLength(1);
+    expect(external[0]).toMatchObject({ configPath, cwd: await realpath(oldRoot), name: settings.portalName });
+    // Reproduce a stale client-owned service beside the active independent one.
+    await background.enable(settings, connection);
+    const version = /\b(\d+\.\d+\.\d+)\b/.exec(await command(binary, ['--version']))![1];
+    const bundle: RuntimeBundle = { schema: 1, id: 'd'.repeat(64), clientVersion: '0.1.4', portalVersion: version, sha256: digest(await readFile(binary)), platform: process.platform, arch: process.arch };
+    const updater = new RuntimeUpdater(directory, background);
+    expect((await updater.sync(binary, bundle, settings, connection)).phase).toBe('updated');
+    expect(background.state.running).toBe(true);
+    expect(await readFile(background.installedService!.configPath!, 'utf8')).toBe(original);
+    expect(await observer.forUpgrade(connection, background.label, background.installedService!.root)).toEqual([]);
+  } finally {
+    await background.disable();
+    const { portableCommand } = await import('../desktop/background');
+    await portableCommand(oldBinary, 'stop').catch(() => {});
+    child?.kill();
+    if (process.platform === 'darwin' && background.installedService?.file) await rm(background.installedService.file, { force: true });
+    if (process.platform === 'win32') {
+      const script = windowsModulePath + `$task=Get-ScheduledTask | Where-Object TaskName -eq '${background.label}'; if ($task) { $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop }; exit 0`;
+      await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+}, 180_000);

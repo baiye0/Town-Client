@@ -26,6 +26,11 @@ const ps = (value: string) => `'${value.replaceAll("'", "''")}'`;
 // A Node/Electron parent launched by pwsh inherits PS7 module paths. Native
 // Windows PowerShell must load its own compatible management/security modules.
 export const windowsModulePath = '$env:PSModulePath = "$PSHOME\\Modules"; ';
+export async function portableCommand(binary: string, action: 'stop' | 'status' | 'start', platform = process.platform, run: Command = command) {
+  if (platform !== 'win32') return run(binary, action === 'start' ? [] : [action]);
+  const script = windowsModulePath + `& ${ps(binary)} ${action === 'start' ? '' : action}; if ($LASTEXITCODE -ne 0) { throw 'Portal lifecycle command failed' }`;
+  return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
+}
 const xml = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 16);
 export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; environment?: Record<string, string>; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string }
@@ -179,9 +184,9 @@ export class BackgroundPortal {
     if (!service) return this.state;
     let enabled = false, running = false, loaded = true, pid: number | undefined;
     if (service.kind === 'portable') {
-      const status = JSON.parse(await this.run(service.binary!, ['status']));
-      running = Array.isArray(status.portal_pids) && status.portal_pids.length === 1 && Boolean(status.supervisor);
-      enabled = running; pid = running ? status.portal_pids[0] : undefined;
+      const status = JSON.parse(await portableCommand(service.binary!, 'status', this.platform, this.run));
+      running = this.platform === 'win32' ? Boolean(status.ready) : Array.isArray(status.portal_pids) && status.portal_pids.length === 1 && Boolean(status.supervisor || status.launchagent_loaded);
+      enabled = running; pid = running ? (this.platform === 'win32' ? status.pid : status.portal_pids[0]) : undefined;
     } else if (this.platform === 'darwin') {
       await access(service.file); // Missing registration must not be presented as healthy.
       const disabled = await this.run('/bin/launchctl', ['print-disabled', this.domain]);
@@ -295,10 +300,14 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login
   }
   async load(service: Service) {
     if (service.kind === 'portable') {
+      const status = JSON.parse(await portableCommand(service.binary!, 'status', this.platform, this.run));
+      if (status.supervisor || status.launchagent_loaded || status.supervised) return;
+      if (status.portal_pids?.length || status.ready) throw new Error('旧 Portal 尚未完全停止，未重复启动。');
+      if (this.platform === 'win32') { await portableCommand(service.binary!, 'start', this.platform, this.run); return; }
       if (!this.connection) throw new Error('恢复原 Portal 缺少连接配置。');
       const child = spawn(service.binary!, ['--config', service.configPath!, '--name', service.name!], {
         cwd: service.cwd, detached: true, stdio: 'ignore', windowsHide: true,
-        env: { ...process.env, ...(service.environmentPath ? { PATH: service.environmentPath } : {}), PORTAL_CONNECT_LINK: this.connection.link, HEART_PORTAL_SUPERVISED: undefined },
+        env: { ...process.env, ...service.environment, ...(service.environmentPath ? { PATH: service.environmentPath } : {}), PORTAL_CONNECT_LINK: this.connection.link, HEART_PORTAL_SUPERVISED: undefined, HEART_PORTAL_MACOS_SUPERVISOR: undefined },
       });
       await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
       child.unref();
@@ -321,9 +330,9 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login
   }
   async unload(service: Service) {
     if (service.kind === 'portable') {
-      await this.run(service.binary!, ['stop']);
-      const status = JSON.parse(await this.run(service.binary!, ['status']));
-      if (status.supervisor || status.portal_pids?.length) throw new Error('原 Portal 或守护程序尚未退出。');
+      await portableCommand(service.binary!, 'stop', this.platform, this.run);
+      const status = JSON.parse(await portableCommand(service.binary!, 'status', this.platform, this.run));
+      if (status.supervisor || status.portal_pids?.length || status.launchagent_loaded || status.supervised || status.ready) throw new Error('原 Portal 或守护程序尚未退出。');
       return;
     }
     if (this.platform === 'darwin') {

@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -39,7 +39,7 @@ async function fixture(platform: 'darwin' | 'win32' = 'darwin') {
   await writeFile(previous.configPath!, original);
   const binary = path.join(root, 'new-engine'); await writeFile(binary, 'new executable');
   const bundle: RuntimeBundle = { schema: 1, id: 'a'.repeat(64), clientVersion: '0.1.1', portalVersion: '0.8.1', sha256: digest(await readFile(binary)), platform, arch: process.arch };
-  const updater = (ready: (service: any) => Promise<void> = async () => {}, version = '0.8.1') => new RuntimeUpdater(profile, background, platform, ready, async () => version);
+  const updater = (ready: (service: any) => Promise<void> = async () => {}, version = '0.8.1') => new RuntimeUpdater(profile, background, platform, ready, async () => version, async () => []);
   calls.length = 0;
   return { root, profile, background, previous, original, settings, connection, binary, bundle, calls, updater };
 }
@@ -69,16 +69,20 @@ for (const platform of ['darwin', 'win32'] as const) {
     expect(await readFile(f.previous.configPath!, 'utf8')).toBe(f.original);
     await expect(readFile(path.join(f.profile, 'runtime-update.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
-  it(`does not restart a disabled ${platform} service while upgrading`, async () => {
+  it(`automatically starts a disabled ${platform} service after a client upgrade`, async () => {
     const f = await fixture(platform); await f.background.disable(); f.calls.length = 0;
-    await f.updater(async () => { throw new Error('must not launch'); }).sync(f.binary, f.bundle, f.settings, f.connection);
-    expect(f.background.state.enabled).toBe(false); expect(f.background.state.running).toBe(false);
-    expect(f.calls.some(s => s.includes(platform === 'darwin' ? 'bootstrap' : 'Enable-ScheduledTask'))).toBe(false);
+    await f.updater().sync(f.binary, f.bundle, f.settings, f.connection);
+    expect(f.background.state.enabled).toBe(true); expect(f.background.state.running).toBe(true);
+    expect(f.calls.some(s => s.includes(platform === 'darwin' ? 'bootstrap' : 'Enable-ScheduledTask'))).toBe(true);
   });
 }
-it('preserves newer engines and rejects corrupt candidates before touching a service', async () => {
+it('retains a newer engine while updating its supervisor once, and rejects corrupt packages', async () => {
   const f = await fixture();
-  expect((await f.updater(undefined, '0.8.2').sync(f.binary, f.bundle, f.settings, f.connection)).phase).toBe('skipped');
+  const current = await readFile(path.join(f.previous.root, 'heart-portal'));
+  expect((await f.updater(undefined, '0.8.2').sync(f.binary, f.bundle, f.settings, f.connection)).phase).toBe('updated');
+  expect(await readFile(path.join(f.background.installedService!.root, 'heart-portal'))).toEqual(current);
+  f.calls.length = 0;
+  expect((await f.updater(undefined, '0.8.2').sync(f.binary, f.bundle, f.settings, f.connection)).phase).toBe('current');
   expect(f.calls).toEqual([]);
   await writeFile(f.binary, 'corrupted');
   await expect(f.updater().sync(f.binary, f.bundle, f.settings, f.connection)).rejects.toThrow('校验失败');
@@ -108,4 +112,38 @@ it('preserves legacy launch environment and connection bytes during migration', 
   const runner = await readFile(path.join(current.root, 'run.sh'), 'utf8');
   expect(runner).toContain('/custom tools/bin:/usr/bin');
   expect(current.environment).toEqual({ PATH: '/custom tools/bin:/usr/bin', LEGACY_OPTION: "spaces and ' quotes" });
+});
+
+for (const platform of ['darwin', 'win32'] as const) {
+  it(`stops both the recorded ${platform} service and an independent supervisor before replacement`, async () => {
+    const f = await fixture(platform);
+    const root = path.join(f.root, 'independent'); await mkdir(root);
+    const configPath = path.join(root, 'original.toml'); await writeFile(configPath, f.original);
+    await writeFile(path.join(root, '.portal-connection.url'), f.connection.link);
+    const external = { ...f.previous, root, configPath, binary: process.execPath, existing: true, kind: 'portable' as const, name: 'original-name', cwd: root, environment: { ORIGINAL: 'preserved' } };
+    const events: string[] = [];
+    const stop = f.background.unload.bind(f.background), install = f.background.installRegistration.bind(f.background);
+    vi.spyOn(f.background, 'unload').mockImplementation(async service => { events.push('stop:' + service.root); if (service.kind !== 'portable') await stop(service); });
+    vi.spyOn(f.background, 'installRegistration').mockImplementation(async service => { events.push('install'); await install(service); });
+    const updater = new RuntimeUpdater(f.profile, f.background, platform, async () => {}, async () => '0.8.1', async () => [external]);
+    await updater.sync(f.binary, f.bundle, f.settings, f.connection);
+    expect(events).toEqual(['stop:' + f.previous.root, 'stop:' + root, 'install']);
+    expect(f.background.installedService).toMatchObject({ configPath, cwd: root, name: 'original-name', environment: { ORIGINAL: 'preserved' } });
+    expect(f.background.state.running).toBe(true);
+  });
+}
+
+it('restores an independent supervisor if the new engine fails', async () => {
+  const f = await fixture();
+  const root = path.join(f.root, 'independent'); await mkdir(root);
+  await writeFile(path.join(root, '.portal-connection.url'), f.connection.link);
+  const external = { ...f.previous, root, binary: process.execPath, kind: 'portable' as const, existing: true };
+  const stop = f.background.unload.bind(f.background), start = f.background.load.bind(f.background);
+  const restored: string[] = [];
+  vi.spyOn(f.background, 'unload').mockImplementation(async service => { if (service.kind !== 'portable') await stop(service); });
+  vi.spyOn(f.background, 'load').mockImplementation(async service => { if (service.kind === 'portable') restored.push(service.root); else await start(service); });
+  const updater = new RuntimeUpdater(f.profile, f.background, 'darwin', async () => { throw new Error('bad candidate'); }, async () => '0.8.1', async () => [external]);
+  await expect(updater.sync(f.binary, f.bundle, f.settings, f.connection)).rejects.toThrow('已恢复旧服务');
+  expect(restored).toEqual([root]);
+  expect(f.background.installedService).toEqual(f.previous);
 });

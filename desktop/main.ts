@@ -301,13 +301,14 @@ async function ready() {
       }
       if (app.isPackaged) {
         const { bundle, binary: bundledBinary } = await loadRuntimeBundle(process.resourcesPath);
-        if (background.installedService) {
-          runtimeUpdate = await updater.sync(bundledBinary, bundle, store.settings, store.connection);
+        runtimeUpdate = await updater.sync(bundledBinary, bundle, store.settings, store.connection);
+        if (runtimeUpdate.phase !== 'skipped') {
           if (runtimeUpdate.phase === 'current' || runtimeUpdate.phase === 'updated') {
-            await store.save({ ...store.settings, portalBinary: bundledBinary });
+            const service = background.installedService!;
+            await store.save({ ...store.settings, portalBinary: path.join(service.root, process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'), portalConfigPath: service.configPath, workspace: service.cwd || store.settings.workspace, portalEnvironmentPath: service.environment?.PATH || store.settings.portalEnvironmentPath, portalName: service.name || store.settings.portalName });
           }
           await publishBackground();
-          // Respect a stopped service even if a stale UI preference says enabled.
+          // The completed upgrade owns and starts the replacement service.
           return;
         }
         if (await observeExternal()) {
