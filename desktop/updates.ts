@@ -41,7 +41,7 @@ export class UpdateChecker {
       if (release.draft || release.prerelease || typeof release.tag_name !== 'string' || !Array.isArray(release.assets) || !release.assets.length) throw new Error('No complete stable release');
       const newer = compareVersions(release.tag_name, this.version) > 0;
       return this.publish({ phase: newer ? 'available' : 'current', latestVersion: release.tag_name.replace(/^v/, ''),
-        message: newer ? '发现新版本。下载安装后，首次启动会同步 Portal 和守护程序。' : '当前已是最新正式版本。',
+        message: newer ? '发现新版本。可手动下载并升级客户端、Portal 和守护程序。' : '当前已是最新正式版本。',
         releaseUrl: `https://github.com/${this.repository}/releases/tag/${encodeURIComponent(release.tag_name)}` });
     } catch { return this.publish({ phase: 'unavailable', message: '暂时无法检查更新，可以稍后重试或打开发布页。' }); }
   }

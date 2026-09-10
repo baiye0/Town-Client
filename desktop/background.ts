@@ -33,7 +33,7 @@ export async function portableCommand(binary: string, action: 'stop' | 'status' 
 }
 const xml = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 16);
-export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; environment?: Record<string, string>; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string }
+export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; environment?: Record<string, string>; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string; legacyProcessHealth?: boolean }
 export function fingerprint(settings: Settings, connection: Connection) {
   return hash(JSON.stringify([connection.link, settings.portalBinary, settings.portalConfigPath, settings.portalName,
     settings.workspace, settings.portalEnvironmentPath, settings.allowExec, settings.kitsEnabled, "status-v1"]));

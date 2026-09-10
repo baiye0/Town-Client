@@ -4,23 +4,26 @@
 //! Heart's MCP supervisor connects to Portal via TCP.
 //! Portal can run on Town Home, a human's laptop, or anywhere.
 
+mod bounded_file;
 mod child_process;
 mod config;
 mod connection_status;
 mod exec_policy;
-mod io_limits;
 mod kits;
 #[cfg(target_os = "macos")]
 mod macos_supervisor;
 #[cfg(target_os = "macos")]
 mod macos_upgrade;
 mod mcp;
+mod paths;
 mod process_manager;
 mod protocol;
 mod relay_client;
 mod single_instance;
 mod tools;
 mod upgrade;
+#[cfg(any(windows, target_os = "macos"))]
+mod user_installation;
 #[cfg(windows)]
 mod windows_private;
 #[cfg(windows)]
@@ -32,7 +35,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{BufReader, BufWriter};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tracing::{debug, info, trace, warn};
 
@@ -47,6 +50,9 @@ use crate::tools::ToolHost;
     about = "Heart Portal — Being's gateway to the world"
 )]
 struct Cli {
+    /// Prepare the stable user installation for OS installers without starting it
+    #[arg(long, hide = true)]
+    install_user_runtime: bool,
     /// Export version-matched Windows supervision code for the update worker
     #[arg(long, hide = true)]
     export_windows_runtime: Option<PathBuf>,
@@ -75,13 +81,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect configuration paths or copy legacy configuration into the user directory
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Stop this Windows/macOS Portal and its supervision
     Stop,
     /// Show the running Windows/macOS Portal and supervisor status
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
+    Status,
     /// Check GitHub releases and upgrade to the latest version
     Upgrade {
         /// Apply a pre-downloaded newer Windows/macOS binary through the same updater
@@ -102,6 +110,27 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommands {
+    /// Show the effective configuration path and the central user directory (no secrets)
+    Path,
+    /// Create the default user config if absent; preserve existing configuration
+    Init,
+    /// Preview a non-destructive configuration migration; --apply publishes the copy
+    Migrate {
+        #[arg(long)]
+        from: PathBuf,
+        /// Separate named configuration under ~/.heart-portal/profiles/<name>/
+        #[arg(long)]
+        profile: Option<String>,
+        /// Original installation directory when its launch metadata is elsewhere
+        #[arg(long)]
+        installation: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum KitCommands {
     /// List installed kits
     List,
@@ -111,19 +140,136 @@ enum KitCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        // Older updaters execute the staged candidate with --version before
+        // stopping Portal. Reject relocation here, before clap handles that
+        // flag: waiting until startup would depend on the old rollback owner.
+        let source = std::env::current_exe()?;
+        let staged = source.parent().and_then(std::path::Path::parent)
+            .is_some_and(|parent| parent.file_name() == Some(std::ffi::OsStr::new(".portal-upgrades")));
+        anyhow::ensure!(!staged || user_installation::is_managed(&source)?,
+            "Stop the legacy Portal, then launch the new download directly to migrate into ~/.heart-portal before upgrading");
+    }
+    if std::env::args().skip(1).collect::<Vec<_>>() == ["status", "--json"] {
+        return connection_status::show();
+    }
+    let runtime_started = std::time::Instant::now();
+    connection_status::publish("starting");
     let cli = Cli::parse();
+    if std::env::var_os("HEART_PORTAL_EXTERNAL_TOOL").is_some() {
+        // Prevent accidental recursive host administration from managed MCP
+        // processes. This inherited marker is not a hostile-code security check.
+        let read_only = matches!(
+            &cli.command,
+            Some(Commands::Status | Commands::Kit { .. })
+                | Some(Commands::Config {
+                    command: ConfigCommands::Path
+                })
+                | Some(Commands::Upgrade { status: true, .. })
+        );
+        anyhow::ensure!(read_only && !cli.legacy_upgrade && cli.export_windows_runtime.is_none() && !cli.install_user_runtime,
+            "Managed external tools cannot start, stop, upgrade or reconfigure Portal; use the host management channel");
+    }
     if let Some(path) = &cli.export_windows_runtime {
         #[cfg(windows)]
         return windows_upgrade::export_runtime(path);
         #[cfg(not(windows))]
-        {
-            let _ = path;
-            anyhow::bail!("Windows runtime export is available only on Windows");
+        anyhow::bail!("Windows runtime export is available only on Windows");
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let source = std::env::current_exe()?;
+        let managed = user_installation::is_managed(&source)?;
+        let explicit_config = cli.config.as_deref().or(cli.config_positional.as_deref());
+        if cli.install_user_runtime {
+            let target = user_installation::prepare(&source, explicit_config)?;
+            println!("{}", serde_json::json!({"root": user_installation::legacy_root(&target)?, "executable": target}));
+            return Ok(());
+        }
+        let lifecycle = cli.command.is_none() || cli.legacy_upgrade || matches!(
+            &cli.command, Some(Commands::Stop | Commands::Status | Commands::Upgrade { .. }));
+        // Stop/status still reach an old installation before its controlled move.
+        let legacy_management = matches!(&cli.command, Some(Commands::Stop | Commands::Status))
+            && user_installation::has_legacy_state(&source)? && !user_installation::migrated_source(&source)?;
+        // Explicit launch paths and OS-supervised runtimes keep their chosen
+        // installation owner. The desktop performs their transactional upgrades.
+        if !managed && lifecycle && !legacy_management && explicit_config.is_none()
+            && std::env::var("HEART_PORTAL_SUPERVISED").as_deref() != Ok("1") {
+            anyhow::ensure!(std::env::var("HEART_PORTAL_SUPERVISED").as_deref() != Ok("1"),
+                "Stop the legacy supervisor, then launch Portal directly to migrate into ~/.heart-portal");
+            if cli.command.is_none() {
+                let target = user_installation::prepare(&source, explicit_config)?;
+                return user_installation::delegate(&target, &cli);
+            }
+            let target = user_installation::executable()?;
+            anyhow::ensure!(target.is_file(), "No user Portal installation found; start Portal once first");
+            return user_installation::delegate(&target, &cli);
         }
     }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    if cli.install_user_runtime {
+        anyhow::bail!("User runtime installation is supported on Windows and macOS");
+    }
     let command = cli.command;
-    if matches!(command, Some(Commands::Status { json: true })) {
-        return connection_status::show();
+    if let Some(Commands::Config { command }) = &command {
+        let data = paths::data_dir()?;
+        return match command {
+            ConfigCommands::Path | ConfigCommands::Init => {
+                let explicit = cli
+                    .config
+                    .as_deref()
+                    .or(cli.config_positional.as_deref())
+                    .map(std::path::Path::new);
+                let location = paths::locate_config(explicit, &paths::legacy_dirs()?)?;
+                if matches!(command, ConfigCommands::Init) {
+                    paths::initialize_config(&location)?;
+                    PortalConfig::load(
+                        location
+                            .path
+                            .to_str()
+                            .context("Config path must be Unicode")?,
+                    )?;
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"config": location, "user_directory": data})
+                );
+                Ok(())
+            }
+            ConfigCommands::Migrate {
+                from,
+                profile,
+                installation,
+                apply,
+            } => {
+                let root = match installation {
+                    Some(root) => Some(std::path::absolute(paths::expand_home(root)?)?),
+                    None => match paths::legacy_dirs()?.into_iter().next() {
+                        Some(root) if paths::matching_installation(from, &root)? => Some(root),
+                        _ => None,
+                    },
+                };
+                if let Some(root) = &root {
+                    anyhow::ensure!(root.is_dir(), "Original installation directory not found");
+                }
+                let plan = paths::plan_migration_with_installation(
+                    from,
+                    &data,
+                    profile.as_deref(),
+                    root.as_deref(),
+                )?;
+                if *apply {
+                    plan.apply()?;
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"applied": apply, "migration": plan,
+                    "activation": "Start Portal with --config pointing to the destination at the next controlled restart. Existing running instances and source files are unchanged."})
+                );
+                Ok(())
+            }
+        };
     }
 
     if matches!(&command, Some(Commands::Upgrade { status: true, .. })) {
@@ -160,7 +306,7 @@ async fn main() -> Result<()> {
     if cli.legacy_upgrade || matches!(&command, Some(Commands::Upgrade { .. })) {
         return upgrade::run_upgrade().await;
     }
-    if matches!(&command, Some(Commands::Stop | Commands::Status { .. })) {
+    if matches!(&command, Some(Commands::Stop | Commands::Status)) {
         #[cfg(windows)]
         return windows_start::run(
             if matches!(&command, Some(Commands::Stop)) {
@@ -201,7 +347,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info".parse().unwrap_or_else(|e| {
+                "info,heart_portal=debug".parse().unwrap_or_else(|e| {
                     eprintln!("Failed to parse default log filter: {}", e);
                     tracing_subscriber::EnvFilter::new("info")
                 })
@@ -211,38 +357,45 @@ async fn main() -> Result<()> {
 
     // Supervisors can provide the Loom link through the environment so the
     // credential is not exposed in the OS process command line.
-    let connect_link = cli.connect.or_else(|| {
+    let mut connect_link = cli.connect.or_else(|| {
         std::env::var("PORTAL_CONNECT_LINK")
             .ok()
             .filter(|link| !link.trim().is_empty())
     });
-    let explicit_config = cli.config.is_some() || cli.config_positional.is_some();
-    let config_path = cli
+    let explicit_config = cli
         .config
-        .or(cli.config_positional)
-        .unwrap_or_else(|| "portal.toml".to_string());
+        .as_deref()
+        .or(cli.config_positional.as_deref())
+        .map(std::path::Path::new);
+    let location = paths::locate_config(explicit_config, &paths::legacy_dirs()?)?;
+    let config_path = location
+        .path
+        .to_str()
+        .context("Config path must be Unicode")?
+        .to_owned();
+    info!("Config path: {} ({})", config_path, location.source);
     let cli_portal_name = cli.name;
 
-    let mut config = if PathBuf::from(&config_path).exists() {
+    if !matches!(&command, Some(Commands::Kit { .. })) {
+        paths::initialize_config(&location)?;
+    }
+    let config_loaded = PathBuf::from(&config_path).try_exists()?;
+    let mut config = if config_loaded {
         PortalConfig::load(&config_path)?
     } else {
-        anyhow::ensure!(!explicit_config, "Config file not found: {}", config_path);
         info!("No config file at {}, using defaults", config_path);
-        let mut config = PortalConfig::default();
-        #[cfg(not(windows))]
-        {
-            config.security.workspace_root = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|path| path.join(".heart-portal/workspace"))
-                .unwrap_or_else(|| PathBuf::from("./workspace"));
-        }
-        config.tools.exec = false;
-        config.tools.screenshot = false;
-        config.tools.custom_tools_enabled = false;
-        config.kits_enabled = false;
-        config
+        let mut defaults = PortalConfig::default();
+        defaults.bind_host = "127.0.0.1".into();
+        defaults.security.workspace_root = paths::data_dir()?.join("workspace");
+        defaults
     };
+    for warning in &config.warnings {
+        warn!(
+            "Config warning [{}] {}: {}",
+            warning.code, warning.field, warning.message
+        );
+    }
+    connect_link = connect_link.or_else(|| config.connect_link.clone());
 
     if let Ok(t) = std::env::var("PORTAL_MCP_TOKEN") {
         if !t.is_empty() {
@@ -278,19 +431,9 @@ async fn main() -> Result<()> {
         }
         None => format!("standalone/{}:{}", config.bind_host, config.bind_port),
     };
-    let _single_instance = match single_instance::acquire(Some(&instance_identity)) {
-        Ok(guard) => guard,
-        Err(error) if error.contains("another Portal instance") => {
-            eprintln!("{error}");
-            std::process::exit(73);
-        }
-        Err(error) => return Err(anyhow::anyhow!(error)),
-    };
+    let _single_instance =
+        single_instance::acquire(Some(&instance_identity)).map_err(|e| anyhow::anyhow!(e))?;
 
-    if connect_link.is_none() {
-        anyhow::ensure!(config.portal_mcp_token.as_deref().is_some_and(|token| !token.trim().is_empty()),
-            "Local MCP requires portal_mcp_token or PORTAL_MCP_TOKEN; connect mode does not open a local listener");
-    }
     config.prepare_workspace()?;
     info!(
         "Workspace ready: {}",
@@ -305,6 +448,10 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    if config.portal_mcp_token.is_none() {
+        if connect_link.is_none() { anyhow::bail!("Local MCP requires PORTAL_MCP_TOKEN or portal_mcp_token; relay mode uses the Being credential"); }
+    }
+
     if connect_link.is_some() {
         info!(
             "Portal '{}' connect mode — MCP via Hearth relay",
@@ -317,13 +464,26 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Initialize tool host (built-in + custom)
-    connection_status::publish("starting");
-    let tool_host = ToolHost::new(&config);
+    // Resolve the advertised identity once; diagnostics and the relay handshake
+    // must describe the same running instance, including CLI/environment overrides.
+    let effective_name = if connect_link.is_some() {
+        relay_portal_name(cli_portal_name, &config.name, default_relay_portal_name)
+    } else {
+        config.name.clone()
+    };
+    let runtime = tools::status::RuntimeStatus::capture(
+        &config,
+        location,
+        config_loaded,
+        effective_name.clone(),
+        connect_link.is_some(),
+        runtime_started,
+    );
+    let tool_host = ToolHost::new_with_runtime(&config, runtime);
 
     if config.kits_enabled {
         tool_host.start_kit_refresh_task();
-        info!("Kit manifest hot-reload started (every 60s)");
+        info!("Kit manifest and .env hot-reload started (every 5s)");
     }
 
     let cleanup_host = tool_host.clone();
@@ -334,13 +494,6 @@ async fn main() -> Result<()> {
             cleanup_host.cleanup_background_sessions().await;
         }
     });
-
-    // Load custom tools from workspace/tools/mcp.toml
-    match tool_host.load_custom_tools().await {
-        Ok(0) => info!("No custom tools loaded"),
-        Ok(n) => info!("Loaded {} custom tools", n),
-        Err(e) => warn!("Failed to load custom tools: {}", e),
-    }
 
     let tool_list = tool_host.list_tools().await;
     info!(
@@ -360,11 +513,16 @@ async fn main() -> Result<()> {
     warmup.spawn(async move {
         warmup_host.warmup_kits().await;
     });
+    let custom_host = tool_host.clone();
+    warmup.spawn(async move {
+        match custom_host.load_custom_tools().await {
+            Ok(count) => info!("Loaded {} custom MCP tools", count),
+            Err(_) => warn!("Custom MCP startup failed; Portal remains available"),
+        }
+    });
 
     if let Some(ref loom) = connect_link {
-        // Relay handshake identity: --name, non-generic config name, then host name.
-        let relay_portal_name =
-            relay_portal_name(cli_portal_name, &config.name, default_relay_portal_name);
+        let relay_portal_name = effective_name;
 
         // Async callback: finished background sessions POST back to the being's
         // Heart, which writes the inbox and triggers breathe_callback.
@@ -417,13 +575,8 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", config.bind_host, config.bind_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Portal MCP listening on {}", addr);
+    tool_host.set_connection_state(tools::status::ConnectionState::Listening);
     connection_status::publish("local");
-    let local_status = tokio::spawn(async {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            connection_status::publish("local");
-        }
-    });
     publish_supervisor_ready()?;
     #[cfg(any(windows, target_os = "macos"))]
     drop(startup_guard);
@@ -452,10 +605,11 @@ async fn main() -> Result<()> {
     });
     drop(shutdown_tx);
 
-    let connection_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let mut status_tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             biased;
+            _ = status_tick.tick() => connection_status::publish("local"),
             res = shutdown_rx.recv() => {
                 match res {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
@@ -467,7 +621,6 @@ async fn main() -> Result<()> {
             }
             accept = listener.accept() => {
                 let (stream, peer) = accept.context("MCP listener accept failed")?;
-                let Ok(connection_permit) = connection_slots.clone().try_acquire_owned() else { continue; };
                 let conn_count = active_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 info!("MCP client connected from {} (active: {})", peer, conn_count);
 
@@ -477,7 +630,6 @@ async fn main() -> Result<()> {
                 let active = active_connections.clone();
 
                 tokio::spawn(async move {
-                    let _connection_permit = connection_permit;
                     if let Err(e) = handle_connection(stream, &tool_host, &portal_name, mcp_token.as_deref()).await {
                         warn!("Connection from {} ended: {}", peer, e);
                     } else {
@@ -490,7 +642,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    local_status.abort();
     drop(listener);
     Ok(())
 }
@@ -549,7 +700,9 @@ async fn show_kit_status(config: &PortalConfig) -> Result<()> {
         "Kit", "Version", "Tools", "Status", "Command"
     );
     for kit in kits {
-        let status = if kits::loader::command_binary_exists(&kit.command) {
+        let status = if kit.configuration_error().is_some() {
+            "needs-configuration"
+        } else if kits::loader::command_binary_exists(&kit.command) {
             "not-started"
         } else {
             "unhealthy"
@@ -562,6 +715,13 @@ async fn show_kit_status(config: &PortalConfig) -> Result<()> {
             status,
             kits::loader::format_command(&kit.command)
         );
+        if let Some(error) = kit.configuration_error() {
+            println!(
+                "  {}. Inspect portal_kits_setup for this kit (env: {})",
+                error,
+                kit.kit_dir.join(".env").display()
+            );
+        }
     }
 
     Ok(())
@@ -569,10 +729,12 @@ async fn show_kit_status(config: &PortalConfig) -> Result<()> {
 
 /// Derive Heart's callback endpoint from the Loom link.
 /// `https://echo.beings.town/alice/?token=…` → `https://echo.beings.town/alice/api/callback`.
-/// Uses the same exact-loopback-only plaintext policy as the relay.
+/// Scheme follows the Loom link, except localhost/127.* which is always plain http.
 fn callback_url(loom_link: &str, host: &str, being_id: &str) -> String {
-    let relay = relay_client::derive_relay_url(loom_link, host);
-    let scheme = if relay.starts_with("ws://") {
+    let is_localhost = relay_client::is_loopback_host(host);
+    let scheme = if is_localhost {
+        "http"
+    } else if loom_link.trim_start().starts_with("http://") {
         "http"
     } else {
         "https"
@@ -654,26 +816,27 @@ where
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut writer = BufWriter::new(write_half);
-    let mut partial = Vec::new();
+    let mut auth_bytes = Vec::new();
 
     if let Some(expected) = expected_token.filter(|t| !t.is_empty()) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let frame = tokio::time::timeout_at(
-                deadline,
-                io_limits::read_frame(&mut reader, &mut partial, 4096),
+            auth_bytes.clear();
+            let bytes_read = tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::mcp::limits::read_line_append(&mut reader, &mut auth_bytes, 64 * 1024),
             )
             .await
-            .context("Authentication timed out")??;
-            let Some(line) = frame else {
+            .context("MCP authentication timed out")??;
+            let line = std::str::from_utf8(&auth_bytes)?;
+            if bytes_read == 0 {
                 debug!("Client disconnected before auth (EOF)");
                 return Ok(());
-            };
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            debug!("MCP authentication request received");
+            debug!("Received MCP authentication message");
 
             let value: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
@@ -751,69 +914,173 @@ where
         }
     }
 
-    use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
-    let mut pending: FuturesUnordered<BoxFuture<'_, (JsonRpcResponse, bool)>> =
-        FuturesUnordered::new();
-    let mut ids = std::collections::HashSet::new();
+    let mut changes = tool_host.subscribe_tools_changed();
+    let mut initialized = false;
+    // Keep bounded work and management capacity separate on a single relay/TCP
+    // connection. A slow community call must not serialize every Being request.
+    let mut calls = tokio::task::JoinSet::<(JsonRpcResponse, bool)>::new();
+    let mut management = tokio::task::JoinSet::<(JsonRpcResponse, bool)>::new();
+    let mut active_requests = std::collections::HashMap::<u64, tokio::task::AbortHandle>::new();
+    // Partial reads survive either a completed request or a change notification.
+    let mut request_bytes = Vec::new();
     loop {
-        tokio::select! {
-            completed = pending.next(), if !pending.is_empty() => {
-                let (response, restart) = completed.expect("pending request");
-                ids.remove(&response.id);
-                send_response(&mut writer, &response).await?;
-                if restart { tool_host.restart_after_response(); }
-                if tool_host.needs_reconnect.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    send_notification(&mut writer, &serde_json::json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}})).await?;
-                }
-            }
-            frame = io_limits::read_frame(&mut reader, &mut partial, io_limits::MAX_FRAME_BYTES) => {
-                let Some(line) = frame? else { return Ok(()); };
-                if line.trim().is_empty() { continue; }
-                let request: JsonRpcRequest = match serde_json::from_str(&line) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        send_response(&mut writer, &rpc_error(None, -32700, "Invalid JSON-RPC request")).await?;
-                        continue;
+        let bytes_read = tokio::select! {
+            Some(result) = management.join_next_with_id(), if !management.is_empty() => {
+                match result {
+                    Ok((task_id, (response, restart))) => {
+                        if response.id.and_then(|id| active_requests.get(&id)).is_some_and(|h| h.id() == task_id) {
+                            active_requests.remove(&response.id.unwrap());
+                            send_response(&mut writer, &response).await?;
+                            if restart { tool_host.restart_after_response(); }
+                        }
                     }
-                };
-                if request.id.is_none() { continue; }
-                if ids.contains(&request.id) {
-                    send_response(&mut writer, &rpc_error(request.id, -32600, "Duplicate in-flight request id; outcome may be unknown")).await?;
-                    continue;
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => return Err(error.into()),
                 }
-                let control = request.method == "ping" || (request.method == "tools/call"
-                    && request.params["name"] == "portal_process"
-                    && matches!(request.params["arguments"]["action"].as_str(), Some("kill" | "list" | "log")));
-                let permit = match tool_host.request_permit(control) {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        send_response(&mut writer, &rpc_error(request.id, -32000, "Portal busy; request was not started")).await?;
-                        continue;
-                    }
-                };
-                ids.insert(request.id);
-                pending.push(async move {
-                    let _permit = permit;
-                    let response = handle_request(&request, tool_host, portal_name).await;
-                    let restart = request.method == "tools/call" && request.params["name"] == "portal_restart"
-                        && response.error.is_none() && response.result.as_ref().and_then(|v| v["isError"].as_bool()) != Some(true);
-                    (response, restart)
-                }.boxed());
+                continue;
             }
+            Some(result) = calls.join_next_with_id(), if !calls.is_empty() => {
+                match result {
+                    Ok((task_id, (response, _))) => {
+                        if response.id.and_then(|id| active_requests.get(&id)).is_some_and(|h| h.id() == task_id) {
+                            active_requests.remove(&response.id.unwrap());
+                            send_response(&mut writer, &response).await?;
+                        }
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => return Err(error.into()),
+                }
+                continue;
+            }
+            result = crate::mcp::limits::read_line_append(&mut reader, &mut request_bytes, 16 * 1024 * 1024) => result?,
+            result = changes.changed(), if initialized => {
+                result?;
+                send_notification(&mut writer, &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                    "params": {}
+                })).await?;
+                continue;
+            }
+        };
+        if bytes_read == 0 {
+            debug!("Client disconnected (EOF)");
+            return Ok(());
         }
-    }
-}
 
-fn rpc_error(id: Option<u64>, code: i32, message: &str) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0".into(),
-        id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.into(),
-            data: None,
-        }),
+        let line = String::from_utf8(std::mem::take(&mut request_bytes))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        debug!("Received MCP message ({} bytes)", trimmed.len());
+
+        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "Invalid JSON-RPC at line {}, column {}",
+                    e.line(),
+                    e.column()
+                );
+                let error_resp = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: {}", e),
+                        data: None,
+                    }),
+                };
+                send_response(&mut writer, &error_resp).await?;
+                continue;
+            }
+        };
+
+        if request.id.is_none() {
+            if request.method == "notifications/cancelled" {
+                if let Some(id) = request.params.get("requestId").and_then(|v| v.as_u64()) {
+                    if let Some(task) = active_requests.remove(&id) {
+                        task.abort();
+                    }
+                }
+            }
+            continue;
+        }
+        if active_requests.contains_key(&request.id.unwrap()) {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32600,
+                    message: "Request ID is already in progress".into(),
+                    data: None,
+                }),
+            };
+            send_response(&mut writer, &response).await?;
+            continue;
+        }
+
+        if request.method == "initialize" {
+            // Publish initialization before permitting list-change notifications.
+            send_response(
+                &mut writer,
+                &handle_request(&request, tool_host, portal_name).await,
+            )
+            .await?;
+            initialized = true;
+            continue;
+        }
+        let name = request
+            .params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_management = matches!(request.method.as_str(), "ping" | "tools/list")
+            || (request.method == "tools/call"
+                && matches!(
+                    name,
+                    "portal_status"
+                        | "portal_kits_status"
+                        | "portal_kits_setup"
+                        | "portal_kits_reload"
+                        | "portal_restart"
+                ));
+        let restart = request.method == "tools/call" && name == "portal_restart";
+        let tasks = if is_management {
+            &mut management
+        } else {
+            &mut calls
+        };
+        let limit = if is_management {
+            mcp::limits::MANAGEMENT_REQUESTS
+        } else {
+            mcp::limits::WORK_REQUESTS
+        };
+        if tasks.len() >= limit {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32000,
+                    message: "Portal connection is busy; wait for pending requests before retrying"
+                        .into(),
+                    data: None,
+                }),
+            };
+            send_response(&mut writer, &response).await?;
+            continue;
+        }
+        let host = tool_host.clone();
+        let name = portal_name.to_string();
+        let id = request.id.unwrap();
+        let handle =
+            tasks.spawn(async move { (handle_request(&request, &host, &name).await, restart) });
+        active_requests.insert(id, handle);
     }
 }
 
@@ -832,7 +1099,7 @@ async fn handle_request(
             result: Some(serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
-                    "tools": { "listChanged": false }
+                    "tools": { "listChanged": true }
                 },
                 "serverInfo": {
                     "name": format!("heart-portal-{}", portal_name),
@@ -848,11 +1115,18 @@ async fn handle_request(
                 .await
                 .iter()
                 .map(|t| {
-                    serde_json::json!({
+                    let mut tool = serde_json::json!({
                         "name": t.name,
                         "description": t.description,
                         "inputSchema": t.input_schema
-                    })
+                    });
+                    if matches!(
+                        t.name.as_str(),
+                        "portal_status" | "portal_kits_status" | "portal_kits_setup"
+                    ) {
+                        tool["annotations"] = serde_json::json!({"readOnlyHint": true});
+                    }
+                    tool
                 })
                 .collect();
 
@@ -873,17 +1147,22 @@ async fn handle_request(
                     debug!("Missing or invalid tool name in tools/call request");
                     ""
                 });
-            let arguments = request
-                .params
-                .get("arguments")
-                .cloned()
-                .and_then(|v| if v.is_object() { Some(v) } else { None })
-                .unwrap_or_else(|| {
-                    debug!(
-                        "Missing or invalid arguments in tools/call request, using empty object"
-                    );
-                    serde_json::json!({})
-                });
+            let arguments = match request.params.get("arguments") {
+                Some(value) if value.is_object() => value.clone(),
+                None => serde_json::json!({}),
+                Some(_) => {
+                    return JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: "Tool arguments must be an object".into(),
+                            data: None,
+                        }),
+                    }
+                }
+            };
 
             let start = std::time::Instant::now();
             info!("⚡ {} called", tool_name);
@@ -914,7 +1193,10 @@ async fn handle_request(
                     }
                 }
                 Err(e) => {
-                    warn!("⚡ {} → fail: {} ({:?})", tool_name, e, elapsed);
+                    warn!(
+                        "⚡ {} → fail ({:?}); details returned to caller",
+                        tool_name, elapsed
+                    );
                     let message = format!("Tool error: {}", e);
                     JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
@@ -955,7 +1237,16 @@ async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     response: &JsonRpcResponse,
 ) -> Result<()> {
     let json = serde_json::to_string(response)?;
-    io_limits::write_frame(writer, &json).await
+    debug!("Sending MCP response ({} bytes)", json.len());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .context("MCP client stopped reading responses")??;
+    Ok(())
 }
 
 /// Send a JSON-RPC notification (no id, no response expected).
@@ -964,7 +1255,16 @@ async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
     notification: &serde_json::Value,
 ) -> Result<()> {
     let json = serde_json::to_string(notification)?;
-    io_limits::write_frame(writer, &json).await
+    debug!("Sending MCP notification ({} bytes)", json.len());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .context("MCP client stopped reading responses")??;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1035,7 +1335,7 @@ mod tests {
                 "box.local:8080",
                 "bee"
             ),
-            "https://box.local:8080/bee/api/callback"
+            "http://box.local:8080/bee/api/callback"
         );
     }
 

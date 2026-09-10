@@ -10,6 +10,7 @@ mod permissions;
 mod process;
 mod screenshot;
 mod search;
+pub(crate) mod status;
 pub(crate) mod text;
 #[cfg(test)]
 mod utf8_tests;
@@ -19,7 +20,7 @@ mod web_search;
 use crate::config::PortalConfig;
 use crate::kits::{loader, manager::KitManager};
 use crate::process_manager::ProcessManager;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use custom::CustomToolHost;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,23 +38,28 @@ pub struct ToolInfo {
 /// Hosts all available tools (built-in + custom + kit), dispatches calls
 #[derive(Clone)]
 pub struct ToolHost {
-    file_mutation: Arc<tokio::sync::Mutex<()>>,
-    requests: Arc<tokio::sync::Semaphore>,
-    control_requests: Arc<tokio::sync::Semaphore>,
     config: PortalConfig,
     custom: CustomToolHost,
     kits: KitManager,
     pub process_manager: Arc<ProcessManager>,
-    /// Set to true after reload — signals connection handler to close TCP
-    pub needs_reconnect: Arc<AtomicBool>,
+    /// Each connected client receives its own change cursor, including idle clients.
+    tools_changed: tokio::sync::watch::Sender<u64>,
+    kit_refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    custom_reload_lock: Arc<tokio::sync::Mutex<()>>,
     /// A controlled restart requested through the built-in portal_restart tool.
     restart_requested: Arc<AtomicBool>,
     restart_notify: Arc<tokio::sync::Notify>,
     restart_supported: bool,
+    runtime: Arc<status::RuntimeStatus>,
 }
 
 impl ToolHost {
+    #[cfg(test)]
     pub fn new(config: &PortalConfig) -> Self {
+        Self::new_with_runtime(config, status::RuntimeStatus::for_test(config))
+    }
+
+    pub fn new_with_runtime(config: &PortalConfig, runtime: status::RuntimeStatus) -> Self {
         let loaded_kits = match loader::load_kits(config) {
             Ok(kits) => {
                 if !kits.is_empty() {
@@ -68,14 +74,14 @@ impl ToolHost {
         };
 
         Self {
-            file_mutation: Arc::new(tokio::sync::Mutex::new(())),
-            requests: Arc::new(tokio::sync::Semaphore::new(16)),
-            control_requests: Arc::new(tokio::sync::Semaphore::new(4)),
+            runtime: Arc::new(runtime),
             config: config.clone(),
             custom: CustomToolHost::new(),
             kits: KitManager::new(loaded_kits),
             process_manager: Arc::new(ProcessManager::new()),
-            needs_reconnect: Arc::new(AtomicBool::new(false)),
+            tools_changed: tokio::sync::watch::channel(0).0,
+            kit_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            custom_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             restart_requested: Arc::new(AtomicBool::new(false)),
             restart_notify: Arc::new(tokio::sync::Notify::new()),
             restart_supported: std::env::var("HEART_PORTAL_SUPERVISED")
@@ -92,18 +98,6 @@ impl ToolHost {
                     }
                 },
         }
-    }
-
-    pub(crate) fn request_permit(
-        &self,
-        control: bool,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        let slots = if control {
-            &self.control_requests
-        } else {
-            &self.requests
-        };
-        Ok(slots.clone().try_acquire_owned()?)
     }
 
     /// Wait until a tool caller has requested a controlled Portal restart.
@@ -133,10 +127,18 @@ impl ToolHost {
 
     /// Load custom tools from workspace/tools/mcp.toml
     pub async fn load_custom_tools(&self) -> Result<usize> {
+        let _guard = self.custom_reload_lock.lock().await;
         if !self.config.tools.custom_tools_enabled {
             return Ok(0);
         }
-        self.custom.load(&self.config.security.workspace_root).await
+        let count = self
+            .custom
+            .load(&self.config.security.workspace_root)
+            .await?;
+        if count > 0 {
+            self.notify_tools_changed();
+        }
+        Ok(count)
     }
 
     /// Pre-spawn eager kits (manifest.eager == true) so the first call has
@@ -147,22 +149,66 @@ impl ToolHost {
 
     /// Periodically re-scan the kits directory and refresh manifests in place.
     pub fn start_kit_refresh_task(&self) -> tokio::task::JoinHandle<()> {
-        let kits = self.kits.clone();
-        let kits_dir = loader::kits_dir(&self.config);
+        let host = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                status::KIT_REFRESH_INTERVAL_SECS,
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                match loader::load_kits_from_dir(&kits_dir) {
-                    Ok(fresh) => kits.refresh_kits(fresh).await,
-                    Err(err) => warn!("Failed to scan kits directory for refresh: {}", err),
+                if let Err(err) = host.refresh_kits(false).await {
+                    warn!("Failed to refresh kits: {}", err);
                 }
             }
         })
     }
 
-    /// Reload custom tools and signal for reconnection
+    pub fn subscribe_tools_changed(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.tools_changed.subscribe()
+    }
+
+    fn notify_tools_changed(&self) {
+        self.tools_changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    async fn refresh_kits(&self, force: bool) -> Result<crate::kits::manager::KitReloadReport> {
+        self.refresh_kits_target(force, None).await
+    }
+
+    async fn refresh_kits_target(
+        &self,
+        force: bool,
+        target: Option<&str>,
+    ) -> Result<crate::kits::manager::KitReloadReport> {
+        if !self.config.kits_enabled {
+            return Ok(Default::default());
+        }
+        // Serialize scan + reconcile so an older background scan cannot undo
+        // credentials/manifests just applied by an explicit reload.
+        let _guard = self.kit_refresh_lock.lock().await;
+        let kits_dir = loader::kits_dir(&self.config);
+        let fresh =
+            tokio::task::spawn_blocking(move || loader::scan_kits_from_dir(&kits_dir)).await??;
+        if let Some(target) = target {
+            if !fresh.kits.iter().any(|kit| kit.manifest.name == target) {
+                anyhow::bail!(
+                    "Kit '{}' has no loadable manifest; check its installation and manifest.json",
+                    target
+                );
+            }
+        }
+        let report = self.kits.refresh_kits_target(fresh, force, target).await;
+        if report.changed() {
+            self.notify_tools_changed();
+        }
+        Ok(report)
+    }
+
+    /// Reload custom tools and notify connected clients.
     pub async fn reload_custom_tools(&self) -> Result<(usize, Vec<String>)> {
+        let _guard = self.custom_reload_lock.lock().await;
         // Shutdown existing custom MCP servers
         self.custom.shutdown().await;
         if !self.config.tools.custom_tools_enabled {
@@ -180,12 +226,8 @@ impl ToolHost {
             .iter()
             .map(|t| t.name.clone())
             .collect();
-        // Signal reconnection needed
-        self.needs_reconnect.store(true, Ordering::SeqCst);
-        info!(
-            "Tools reloaded: {} custom tools. Reconnect signaled.",
-            count
-        );
+        self.notify_tools_changed();
+        info!("Tools reloaded: {} custom tools.", count);
         Ok((count, names))
     }
 
@@ -193,15 +235,26 @@ impl ToolHost {
     pub async fn list_tools(&self) -> Vec<ToolInfo> {
         let mut tools = self.list_builtin_tools();
         let custom = self.custom.list_tools().await;
-        tools.extend(custom.into_iter().filter(|tool| !is_builtin(&tool.name)));
         let kit_tools = self.kits.list_healthy_tools().await;
-        tools.extend(kit_tools.into_iter().filter(|tool| !is_builtin(&tool.name)));
+        let external: Vec<_> = custom.into_iter().chain(kit_tools).collect();
+        let mut counts = std::collections::HashMap::new();
+        for tool in &external {
+            *counts.entry(tool.name.replace('-', "_")).or_insert(0) += 1;
+        }
+        tools.extend(external.into_iter().filter(|tool| {
+            let name = tool.name.replace('-', "_");
+            !name.starts_with("portal_") && counts[&name] == 1
+        }));
         tools
     }
 
     /// List built-in tools only
     fn list_builtin_tools(&self) -> Vec<ToolInfo> {
-        let mut tools = Vec::new();
+        let mut tools = vec![ToolInfo {
+            name: "portal_status".into(),
+            description: "Read this running Portal's version, startup binary SHA-256 build ID, effective configuration paths and switches, live connection state and loaded kit summary. Read-only: no reload, process launch or credential values. Configuration presence does not validate service permissions. Use portal_kits_setup for kit authorization requirements.".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        }];
 
         if self.config.tools.exec {
             tools.push(ToolInfo {
@@ -477,7 +530,7 @@ impl ToolHost {
         // Always include tools_reload
         tools.push(ToolInfo {
             name: "portal_tools_reload".to_string(),
-            description: "Reload custom tools from workspace/tools/mcp.toml. Call after adding or modifying custom tool scripts.".to_string(),
+            description: "Reload custom tools from workspace/tools/mcp.toml. Kit changes use portal_kits_reload. Connected clients are notified; Portal stays running.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {},
@@ -488,7 +541,7 @@ impl ToolHost {
         if self.restart_supported {
             tools.push(ToolInfo {
                 name: "portal_restart".to_string(),
-                description: "Gracefully exit Portal after returning a response so its OS supervisor can restart it with the same name and load updated kits. Use this instead of taskkill or starting another supervisor.".to_string(),
+                description: "Gracefully exit Portal after returning a response so its OS supervisor can restart it with the same name. For kit changes use portal_kits_reload.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -498,6 +551,21 @@ impl ToolHost {
         }
 
         if self.config.kits_enabled {
+            tools.push(ToolInfo {
+                name: "portal_kits_status".into(),
+                description: "Read cached kit configuration requirements, missing credentials and process status without scanning or reloading. Returns variable names and configured flags, never credential values. Service authorization is checked by each kit.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            });
+            tools.push(ToolInfo {
+                name: "portal_kits_setup".into(),
+                description: "Read one installed kit's cached runtime, dependencies, installation instructions and available auth methods (environment credentials, credential files or kit-managed OAuth/device/CLI login). Returns setup tool names and missing requirements, never local credential values. Does not execute setup steps or grant service access.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"kit": {"type": "string", "description": "Installed kit name"}}, "required": ["kit"], "additionalProperties": false}),
+            });
+            tools.push(ToolInfo {
+                name: "portal_kits_reload".into(),
+                description: "Reload kit code, manifests and credentials without restarting Portal. Pass kit to change only that kit, or omit to discover and reload all. Existing calls finish on their old process. Returns configuration status.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"kit": {"type": "string", "description": "Optional installed kit name to reload"}}, "additionalProperties": false}),
+            });
             tools.push(ToolInfo {
                 name: "portal_kit_usage".to_string(),
                 description: "Returns accumulated call counts per kit since last drain, then resets counters to zero".to_string(),
@@ -514,30 +582,32 @@ impl ToolHost {
 
     /// Execute a tool call (built-in or custom)
     pub async fn call(&self, tool_name: &str, arguments: Value) -> Result<Value> {
-        let enabled = match tool_name {
-            "portal_exec" | "portal_process" => self.config.tools.exec,
-            "portal_file_read" | "portal_file_write" | "portal_file_list" | "portal_file_edit" => {
-                self.config.tools.file
-            }
-            "portal_screenshot" => self.config.tools.screenshot,
-            "portal_web_fetch" => self.config.tools.web_fetch,
-            "portal_search" => self.config.tools.search,
-            "portal_tools_reload" => self.config.tools.custom_tools_enabled,
-            "portal_kit_usage" => self.config.kits_enabled,
-            _ => true,
-        };
-        anyhow::ensure!(enabled, "{tool_name} is disabled in configuration");
-        if !is_builtin(tool_name) {
-            if self.config.tools.custom_tools_enabled && self.custom.has_tool(tool_name).await {
+        // Reserve the diagnostic endpoint: an installed server must not replace
+        // a read-only status query with an arbitrary custom or kit operation.
+        if tool_name == "portal_status" {
+            anyhow::ensure!(
+                arguments.is_null() || arguments.as_object().is_some_and(|args| args.is_empty()),
+                "portal_status takes no arguments"
+            );
+            return self.handle_status().await;
+        }
+        // The Portal management namespace can never be replaced by community tools.
+        if !tool_name.replace('-', "_").starts_with("portal_") {
+            let kit = self.kits.resolve_tool(tool_name).await;
+            let custom_matches = self.custom.tool_match_count(tool_name).await;
+            anyhow::ensure!(custom_matches + usize::from(kit.is_some()) <= 1,
+                "Ambiguous external tool name; rename the conflicting custom/kit tool before calling it");
+            if self.custom.has_tool(tool_name).await {
                 return self.custom.call(tool_name, arguments).await;
             }
-            if self.config.kits_enabled {
-                if let Some((kit, tool)) = self.kits.resolve_tool(tool_name).await {
-                    return self.kits.call_tool(&kit, &tool, arguments).await;
-                }
+            if let Some((kit_name, real_tool_name)) = kit {
+                return self
+                    .kits
+                    .call_tool(&kit_name, &real_tool_name, arguments)
+                    .await;
             }
-            anyhow::bail!("Unknown or disabled tool: {tool_name}");
         }
+
         // Built-in tools
         match tool_name {
             "portal_exec" => {
@@ -553,15 +623,9 @@ impl ToolHost {
                 process::handle(&self.process_manager, arguments).await
             }
             "portal_file_read" => file::read(&self.config, arguments).await,
-            "portal_file_write" => {
-                let _guard = self.file_mutation.lock().await;
-                file::write(&self.config, arguments).await
-            }
+            "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
-            "portal_file_edit" => {
-                let _guard = self.file_mutation.lock().await;
-                file::edit(&self.config, arguments).await
-            }
+            "portal_file_edit" => file::edit(&self.config, arguments).await,
             "portal_screenshot" => {
                 if !self.config.tools.screenshot {
                     anyhow::bail!("portal_screenshot is disabled in configuration");
@@ -573,6 +637,53 @@ impl ToolHost {
             "portal_web_search" => web_search::search(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
+            "portal_kits_setup" => {
+                if !self.config.kits_enabled {
+                    anyhow::bail!("Kits are disabled in configuration");
+                }
+                let kit = arguments
+                    .get("kit")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'kit' argument"))?;
+                let setup = self.kits.setup(kit).await?;
+                Ok(
+                    serde_json::json!({"content": [{"type": "text", "text": serde_json::to_string(&setup)?}]}),
+                )
+            }
+            "portal_kits_reload" | "portal_kits_status" => {
+                if !self.config.kits_enabled {
+                    anyhow::bail!("Kits are disabled in configuration");
+                }
+                if tool_name == "portal_kits_reload" {
+                    let fields = arguments
+                        .as_object()
+                        .context("Reload arguments must be an object")?;
+                    anyhow::ensure!(fields.keys().all(|key| key == "kit"),
+                        "Unknown reload argument; use 'kit' to select one kit, or an empty object to reload all");
+                }
+                let target = match arguments.get("kit") {
+                    None => None,
+                    Some(Value::String(kit)) if !kit.trim().is_empty() => Some(kit.as_str()),
+                    _ => anyhow::bail!("'kit' must be a nonempty kit name"),
+                };
+                let report = if tool_name == "portal_kits_reload" {
+                    self.refresh_kits_target(true, target).await?
+                } else {
+                    Default::default()
+                };
+                let statuses = self.kits.statuses().await;
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": serde_json::to_string(&statuses)?}],
+                    "structuredContent": {
+                        "schema_version": 1,
+                        "kits": report,
+                        "statuses": statuses,
+                        "portal_restart_required": false,
+                        "activation": "next-tool-call",
+                    }
+                }))
+            }
             "portal_restart" => self.handle_restart().await,
             #[cfg(target_os = "macos")]
             "portal_permissions" => Ok(permissions::status()),
@@ -600,7 +711,7 @@ impl ToolHost {
         let message = if already_scheduled {
             "Portal restart is already scheduled."
         } else {
-            "Portal restart scheduled. The supervisor will relaunch it with the same name and load updated kits."
+            "Portal restart scheduled. The supervisor will relaunch it with the same name."
         };
         Ok(serde_json::json!({
             "content": [{"type": "text", "text": message}]
@@ -619,28 +730,149 @@ impl ToolHost {
         }
     }
 
-    /// Reload custom tools and return summary
+    /// Reload custom tools and return a short summary.
     async fn handle_tools_reload(&self) -> Result<Value> {
-        match self.reload_custom_tools().await {
-            Ok((count, names)) => {
-                let msg = if count == 0 {
-                    "Reloaded. No custom tools found in workspace/tools/mcp.toml.".to_string()
-                } else {
-                    format!(
-                        "Reloaded {} custom tools: {}. Connection will reset to apply changes.",
-                        count,
-                        names.join(", ")
-                    )
-                };
-                Ok(serde_json::json!({
-                    "content": [{"type": "text", "text": msg}]
-                }))
-            }
-            Err(e) => Ok(serde_json::json!({
-                "content": [{"type": "text", "text": format!("Reload failed: {}", e)}],
-                "isError": true
-            })),
+        let (count, names) = self.reload_custom_tools().await?;
+        let message = if count == 0 {
+            "Reloaded. No custom tools found in workspace/tools/mcp.toml.".to_string()
+        } else {
+            format!("Reloaded {} custom tools: {}.", count, names.join(", "))
+        };
+        Ok(serde_json::json!({
+            "content": [{"type": "text", "text": message}],
+            "isError": false
+        }))
+    }
+}
+
+#[cfg(test)]
+mod kit_refresh_tests {
+    use super::*;
+    use crate::kits::tests::TestKits;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf};
+
+    async fn read_message(reader: &mut BufReader<ReadHalf<DuplexStream>>) -> Value {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(8), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn idle_clients_receive_reload_and_partial_request_survives_notification() {
+        let root = TestKits::new();
+        let host = ToolHost::new(&PortalConfig {
+            kits_enabled: true,
+            kits_dir: Some(root.0.to_string_lossy().into_owned()),
+            ..PortalConfig::default()
+        });
+        let mut readers = Vec::new();
+        let mut writers = Vec::new();
+        let mut handlers = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = tokio::io::duplex(65536);
+            let server_host = host.clone();
+            handlers.push(tokio::spawn(async move {
+                crate::handle_connection(server, &server_host, "test", None).await
+            }));
+            let (reader, mut writer) = tokio::io::split(client);
+            let mut reader = BufReader::new(reader);
+            writer
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                read_message(&mut reader).await["result"]["capabilities"]["tools"]["listChanged"],
+                true
+            );
+            readers.push(reader);
+            writers.push(writer);
         }
+        writers[0]
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,")
+            .await
+            .unwrap();
+        let dir = root.install("jira", "PORTAL_TEST_KIT_TOKEN=private-test-value");
+        host.call("portal_kits_reload", serde_json::json!({}))
+            .await
+            .unwrap();
+        for reader in &mut readers {
+            assert_eq!(
+                read_message(reader).await["method"],
+                "notifications/tools/list_changed"
+            );
+        }
+        writers[0]
+            .write_all(b"\"method\":\"tools/list\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let reply = read_message(&mut readers[0]).await;
+        assert_eq!(reply["id"], 2);
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "jira_ping"));
+
+        // A real timer scan, with no MCP call to trigger discovery. Both idle
+        // connections learn that a now-unconfigured kit is no longer callable.
+        let refresh = host.start_kit_refresh_task();
+        root.write_env(&dir, "");
+        for reader in &mut readers {
+            assert_eq!(
+                read_message(reader).await["method"],
+                "notifications/tools/list_changed"
+            );
+        }
+        let status = host
+            .call("portal_kits_status", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(status.to_string().contains("needs-configuration"));
+        assert!(!status.to_string().contains("private-test-value"));
+        assert!(!host
+            .list_tools()
+            .await
+            .iter()
+            .any(|t| t.name == "jira_ping"));
+        refresh.abort();
+        let _ = refresh.await;
+        for handler in handlers {
+            handler.abort();
+            let _ = handler.await;
+        }
+        host.kill_all_managed_processes().await;
+    }
+
+    #[tokio::test]
+    async fn disabled_kits_cannot_be_loaded_by_reload_tools_or_background_scan() {
+        let root = TestKits::new();
+        root.install("jira", "PORTAL_TEST_KIT_TOKEN=unused");
+        let host = ToolHost::new(&PortalConfig {
+            kits_enabled: false,
+            kits_dir: Some(root.0.to_string_lossy().into_owned()),
+            ..PortalConfig::default()
+        });
+        let mut changes = host.subscribe_tools_changed();
+        host.refresh_kits(true).await.unwrap();
+        assert!(!changes.has_changed().unwrap());
+        assert!(host
+            .call("portal_kits_reload", serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(!host
+            .list_tools()
+            .await
+            .iter()
+            .any(|t| t.name.starts_with("jira_")));
+        // This also proves custom-tool reload uses the same broadcast path.
+        host.reload_custom_tools().await.unwrap();
+        changes.changed().await.unwrap();
     }
 }
 
@@ -743,170 +975,5 @@ mod restart_tests {
             .unwrap();
         handler.abort();
         let _ = handler.await;
-    }
-}
-
-pub(crate) fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "portal_exec"
-            | "portal_process"
-            | "portal_file_read"
-            | "portal_file_write"
-            | "portal_file_list"
-            | "portal_file_edit"
-            | "portal_screenshot"
-            | "portal_web_fetch"
-            | "portal_web_search"
-            | "portal_search"
-            | "portal_tools_reload"
-            | "portal_restart"
-            | "portal_permissions"
-            | "portal_oauth_authorize"
-            | "portal_kit_usage"
-    )
-}
-
-#[cfg(test)]
-mod guard_tests {
-    use super::*;
-    #[tokio::test]
-    async fn disabled_tools_are_rejected_at_call_time() {
-        let mut config = PortalConfig::default();
-        config.kits_enabled = false;
-        config.tools.exec = false;
-        config.tools.file = false;
-        config.tools.search = false;
-        config.tools.screenshot = false;
-        config.tools.web_fetch = false;
-        config.tools.custom_tools_enabled = false;
-        let host = ToolHost::new(&config);
-        for name in [
-            "portal_exec",
-            "portal_process",
-            "portal_file_read",
-            "portal_file_write",
-            "portal_file_list",
-            "portal_file_edit",
-            "portal_screenshot",
-            "portal_search",
-            "portal_web_fetch",
-            "portal_tools_reload",
-            "portal_kit_usage",
-        ] {
-            let error = host.call(name, serde_json::json!({})).await.unwrap_err();
-            assert!(error.to_string().contains("disabled"), "{name}: {error}");
-        }
-    }
-    #[tokio::test]
-    async fn process_and_request_capacity_is_reserved_atomically() {
-        let host = ToolHost::new(&PortalConfig {
-            kits_enabled: false,
-            ..Default::default()
-        });
-        let slots: Vec<_> = (0..16)
-            .map(|_| host.request_permit(false).unwrap())
-            .collect();
-        assert!(host.request_permit(false).is_err());
-        assert!(
-            host.request_permit(true).is_ok(),
-            "control requests need independent capacity"
-        );
-        drop(slots);
-        assert!(host.request_permit(false).is_ok());
-        let slots: Vec<_> = (0..10)
-            .map(|_| host.process_manager.reserve().unwrap())
-            .collect();
-        assert!(host.process_manager.reserve().is_err());
-        drop(slots);
-        assert!(host.process_manager.reserve().is_ok());
-    }
-
-    #[tokio::test]
-    async fn local_connection_requires_auth_before_dispatch() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        for authenticated in [false, true] {
-            let host = ToolHost::new(&PortalConfig {
-                kits_enabled: false,
-                ..Default::default()
-            });
-            let (mut client, server) = tokio::io::duplex(4096);
-            let task = tokio::spawn(async move {
-                crate::handle_connection(server, &host, "test", Some("private-token")).await
-            });
-            let first = if authenticated {
-                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"auth","params":{"token":"private-token"}})
-            } else {
-                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"})
-            };
-            client
-                .write_all(format!("{first}\n").as_bytes())
-                .await
-                .unwrap();
-            let mut client = BufReader::new(client);
-            let mut line = String::new();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                client.read_line(&mut line),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            let reply: Value = serde_json::from_str(&line).unwrap();
-            if authenticated {
-                assert_eq!(reply["result"]["authenticated"], true);
-            } else {
-                assert_eq!(reply["error"]["code"], -32001);
-            }
-            drop(client);
-            let result = task.await.unwrap();
-            assert_eq!(result.is_ok(), authenticated);
-        }
-    }
-
-    #[tokio::test]
-    async fn same_connection_ping_is_not_blocked_by_a_tool_call() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let temp = tempfile::tempdir().unwrap();
-        let mut config = PortalConfig {
-            kits_enabled: false,
-            ..Default::default()
-        };
-        config.security.workspace_root = temp.path().canonicalize().unwrap();
-        let host = ToolHost::new(&config);
-        let (mut client, server) = tokio::io::duplex(16_384);
-        let task =
-            tokio::spawn(
-                async move { crate::handle_connection(server, &host, "test", None).await },
-            );
-        let command = if cfg!(windows) {
-            "ping -n 10 127.0.0.1 > nul"
-        } else {
-            "sleep 10"
-        };
-        let call = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"portal_exec","arguments":{"command":command}}});
-        client
-            .write_all(
-                format!("{call}\n{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}}\n")
-                    .as_bytes(),
-            )
-            .await
-            .unwrap();
-        let mut client = BufReader::new(client);
-        let mut line = String::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.read_line(&mut line),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 2);
-        drop(client);
-        tokio::time::timeout(std::time::Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
     }
 }

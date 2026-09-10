@@ -68,7 +68,7 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
   const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
   const oldRoot = path.join(root, 'old runtime with spaces');
   const { mkdir } = await import('node:fs/promises'); await mkdir(oldRoot);
-  const oldBinary = path.join(oldRoot, path.basename(binary)); await copyFile(binary, oldBinary); await chmod(oldBinary, 0o700);
+  const oldBinary = path.join(oldRoot, path.basename(binary)); await copyFile(process.env.TOWN_TEST_EXTERNAL_PORTAL || binary, oldBinary); await chmod(oldBinary, 0o700);
   const configPath = path.join(oldRoot, 'custom config.toml');
   const settings: Settings = { endpoint: '', being: '', hasToken: true, portalName: 'manual-upgrade', portalBinary: binary, workspace: oldRoot, autoStart: true, backgroundEnabled: true, allowExec: false, kitsEnabled: false };
   const { portalConfig } = await import('../desktop/portal');
@@ -87,7 +87,9 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
       external = await observer.forUpgrade(connection, background.label);
     }
     expect(external).toHaveLength(1);
-    expect(external[0]).toMatchObject({ configPath, cwd: await realpath(oldRoot), name: settings.portalName });
+    expect(external[0]).toMatchObject({ name: settings.portalName });
+    expect(await realpath(external[0].configPath!)).toBe(await realpath(configPath));
+    expect(await realpath(external[0].cwd!)).toBe(await realpath(oldRoot));
     // Reproduce a stale client-owned service beside the active independent one.
     await background.enable(settings, connection);
     const version = /\b(\d+\.\d+\.\d+)\b/.exec(await command(binary, ['--version']))![1];

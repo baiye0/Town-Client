@@ -41,7 +41,9 @@ impl CustomToolHost {
 
     /// Shutdown existing custom MCP servers
     pub async fn shutdown(&self) {
-        *self.client.lock().await = None;
+        if let Some(client) = self.client.lock().await.take() {
+            client.abort();
+        }
         self.tool_routes.lock().await.clear();
         self.tools.lock().await.clear();
         info!("Custom MCP servers shut down");
@@ -68,7 +70,10 @@ impl CustomToolHost {
         }
 
         info!("Loading custom tools from {}", config_path.display());
-        let content = tokio::fs::read_to_string(&config_path).await?;
+        let content = tokio::task::spawn_blocking(move || {
+            crate::bounded_file::text(&config_path, 256 * 1024)
+        })
+        .await??;
 
         let configs = parse_custom_mcp_config(&content, workspace_root)?;
         if configs.is_empty() {
@@ -77,10 +82,7 @@ impl CustomToolHost {
         }
 
         for cfg in &configs {
-            warn!(
-                "Custom MCP server '{}' will run command: {:?}",
-                cfg.name, cfg.command
-            );
+            warn!("Starting custom MCP server '{}'", cfg.name);
         }
 
         info!("Connecting to {} custom MCP servers...", configs.len());
@@ -105,10 +107,6 @@ impl CustomToolHost {
         let mut routes = Vec::new();
 
         for (server_name, tool_info) in &discovered {
-            if super::is_builtin(&tool_info.name) {
-                warn!("Ignoring reserved custom tool name {}", tool_info.name);
-                continue;
-            }
             // No prefix — Cortex MCP adapter adds "portal_" automatically.
             // Being defines "hello_world" → becomes "portal_hello_world" at Hearth.
             let tool = ToolInfo {
@@ -149,22 +147,33 @@ impl CustomToolHost {
         self.tool_routes.lock().await.iter().any(|(n, _)| n == name)
     }
 
+    pub async fn tool_match_count(&self, name: &str) -> usize {
+        let name = name.replace('-', "_");
+        self.tool_routes
+            .lock()
+            .await
+            .iter()
+            .filter(|(n, _)| n.replace('-', "_") == name)
+            .count()
+    }
+
     /// Call a custom tool by proxying to the underlying MCP server
     pub async fn call(&self, tool_name: &str, arguments: Value) -> Result<Value> {
-        let routes = self.tool_routes.lock().await;
-        let (_, server_name) = routes
-            .iter()
-            .find(|(n, _)| n == tool_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown custom tool: {}", tool_name))?;
-
-        let client_lock = self.client.lock().await;
-        let client_arc = client_lock
+        let server_name = {
+            let routes = self.tool_routes.lock().await;
+            routes
+                .iter()
+                .find(|(name, _)| name == tool_name)
+                .map(|(_, server)| server.clone())
+                .ok_or_else(|| anyhow::anyhow!("Unknown custom tool: {}", tool_name))?
+        };
+        let client_arc = self
+            .client
+            .lock()
+            .await
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Custom MCP client not initialized"))?
-            .clone();
-        let server_name = server_name.clone();
-        drop(client_lock);
-        drop(routes);
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Custom MCP client not initialized"))?;
 
         // Tool name matches MCP server's tool name directly (no prefix stripping needed)
         let real_name = tool_name;
@@ -258,6 +267,16 @@ fn parse_custom_mcp_config(content: &str, workspace_root: &Path) -> Result<Vec<M
     }
 
     let config: McpConfig = toml::from_str(content)?;
+    anyhow::ensure!(config.servers.len() <= 32, "Too many custom MCP servers");
+    let mut names = std::collections::HashSet::new();
+    anyhow::ensure!(
+        config.servers.iter().all(|s| !s.name.is_empty()
+            && s.name.len() <= 128
+            && !s.name.chars().any(char::is_control)
+            && s.command.len() <= 64
+            && names.insert(&s.name)),
+        "Invalid or duplicate custom MCP server name/command"
+    );
     let tools_dir = workspace_root.join("tools");
 
     let mut configs = Vec::new();

@@ -43,6 +43,11 @@ jobs:
           TOWN_NATIVE_UPGRADE_TESTS: '1'
         run: npx vitest run tests/runtime-update-native.test.ts
       - run: npm run make
+      - name: Verify Windows installer launches the new client
+        if: runner.os == 'Windows'
+        env:
+          TOWN_NATIVE_INSTALLER_TESTS: '1'
+        run: npx vitest run tests/manual-installer-native.test.ts
       - uses: actions/upload-artifact@v4
         with:
           name: Town-Client-${{ matrix.os }}
@@ -67,7 +72,7 @@ jobs:
         with:
           path: artifacts
       - name: Validate both packages and stage checksums
-        run: node scripts/stage-release.mjs artifacts release "${GITHUB_REF_NAME#v}"
+        run: node scripts/stage-release.mjs artifacts release "$(node -p 'require("./package.json").version')"
       - name: Publish the complete paired release
         if: startsWith(github.ref, 'refs/tags/')
         env:

@@ -1,21 +1,60 @@
-use crate::child_process::ChildProcess;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWrite, BufReader, BufWriter};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse, McpToolInfo};
+use super::{limits, ownership::ProcessOwner};
 
 /// Default timeout for MCP handshake and metadata requests (initialize, tools/list).
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for tool calls — tools may run for minutes (code review, web fetch, etc.).
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A local admission failure must not terminate other calls on a healthy server.
+#[derive(Debug)]
+pub(crate) struct RequestRejected(&'static str);
+impl std::fmt::Display for RequestRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for RequestRejected {}
+
+#[derive(Debug)]
+pub(crate) struct RemoteError {
+    code: i32,
+    message: String,
+}
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP server returned error: {} (code: {})",
+            self.message, self.code
+        )
+    }
+}
+impl std::error::Error for RemoteError {}
+
+#[derive(Debug)]
+pub(crate) struct RequestTimeout(pub u64);
+impl std::fmt::Display for RequestTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MCP request timed out after {} seconds; outcome is unknown, do not blindly retry writes", self.0)
+    }
+}
+impl std::error::Error for RequestTimeout {}
+
+// One host-wide budget for kit and custom MCP processes, including retired ones.
+static PROCESS_CAPACITY: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// Configuration for a stdio MCP server process.
 #[derive(Debug, Clone)]
@@ -28,15 +67,46 @@ pub struct McpServerConfig {
 
 /// A stdio JSON-RPC connection to a single MCP server.
 pub struct McpConnection {
-    child_task: Option<tokio::task::JoinHandle<Result<()>>>,
-    stop: tokio::sync::watch::Sender<bool>,
+    owner: Option<Arc<ProcessOwner>>,
+    capacity: Vec<tokio::sync::OwnedSemaphorePermit>,
+    child: Option<Child>,
     reader_task: Option<tokio::task::JoinHandle<()>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    cancel_task: Option<tokio::task::JoinHandle<()>>,
+    cancellations: Option<tokio::sync::mpsc::Sender<u64>>,
     writer: Arc<Mutex<BufWriter<Box<dyn AsyncWrite + Send + Unpin>>>>,
-    responses: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+    responses: Arc<SyncMutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
     next_id: AtomicU64,
     config: McpServerConfig,
     alive: Arc<AtomicBool>,
+}
+
+// Remove cancelled calls synchronously so reconnects cannot leak pending slots.
+struct PendingRequest<'a> {
+    connection: &'a McpConnection,
+    id: u64,
+    writing: bool,
+    cancellable: bool,
+}
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        let pending = self
+            .connection
+            .responses
+            .lock()
+            .unwrap()
+            .remove(&self.id)
+            .is_some();
+        if self.writing {
+            self.connection.abort();
+        } else if pending && self.cancellable {
+            if let Some(sender) = &self.connection.cancellations {
+                if sender.try_send(self.id).is_err() {
+                    self.connection.abort();
+                }
+            }
+        }
+    }
 }
 
 impl McpConnection {
@@ -46,14 +116,79 @@ impl McpConnection {
             anyhow::bail!("Empty command for MCP server '{}'", config.name);
         }
 
+        let permit = PROCESS_CAPACITY
+            .get_or_init(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    super::limits::PROCESS_GENERATIONS,
+                ))
+            })
+            .clone()
+            .try_acquire_owned()
+            .context("MCP process limit reached; retry after existing calls finish")?;
         let mut command = tokio::process::Command::new(&config.command[0]);
+        // Do not hand community processes all host/service credentials.
+        command.env_clear();
+        for name in [
+            "PATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "LOGNAME",
+            "SHELL",
+            "TERM",
+            "TMPDIR",
+            "TZ",
+            "__CF_USER_TEXT_ENCODING",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "PROGRAMDATA",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "USER",
+            "USERNAME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         #[cfg(windows)]
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
         command
             .args(&config.command[1..])
             .envs(&config.env)
+            .env("HEART_PORTAL_EXTERNAL_TOOL", "1")
             .env_remove("HEART_PORTAL_SUPERVISED")
             .env_remove("PORTAL_CONNECT_LINK")
+            .env_remove("PORTAL_MCP_TOKEN")
+            .env_remove("HEART_PORTAL_READY_FILE")
+            .env_remove("HEART_PORTAL_READY_NONCE")
+            .env_remove("HEART_PORTAL_STATUS_FILE")
+            .env_remove("HEART_PORTAL_STATUS_NONCE")
+            .env_remove("HEART_PORTAL_MACOS_SUPERVISOR")
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -63,12 +198,8 @@ impl McpConnection {
             command.current_dir(cwd);
         }
 
-        let mut child = ChildProcess::spawn(&mut command).with_context(|| {
-            format!(
-                "Failed to spawn MCP server '{}' with command: {:?}",
-                config.name, config.command
-            )
-        })?;
+        let (mut child, owner) = ProcessOwner::spawn(&mut command)
+            .with_context(|| format!("Failed to spawn MCP server '{}'", config.name))?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             anyhow::anyhow!("Failed to get stdin for MCP server '{}'", config.name)
@@ -79,34 +210,16 @@ impl McpConnection {
 
         let stderr = child.stderr.take();
 
-        let responses = Arc::new(Mutex::new(HashMap::new()));
+        let responses = Arc::new(SyncMutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let (stop, mut stopped) = tokio::sync::watch::channel(false);
-        let reader_done = Arc::new(tokio::sync::Notify::new());
-        let process_reader_done = reader_done.clone();
-        let process_alive = alive.clone();
-        let process_responses = responses.clone();
-        let process_name = config.name.clone();
-        let child_task = tokio::spawn(async move {
-            let result = tokio::select! {
-                biased;
-                _ = stopped.changed() => child.terminate().await.map(|_| ()),
-                result = child.wait() => result.map(|_| ()).map_err(anyhow::Error::from),
-            };
-            process_alive.store(false, Ordering::SeqCst);
-            // Let the reader deliver buffered final responses before failing
-            // anything left over. Escaped pipe holders cannot delay this forever.
-            let _ =
-                tokio::time::timeout(Duration::from_secs(2), process_reader_done.notified()).await;
-            Self::drop_pending(process_responses, &process_name).await;
-            result
-        });
-        let reader_stop = stop.clone();
         let mut connection = Self {
-            child_task: Some(child_task),
-            stop,
+            owner: Some(Arc::new(owner)),
+            capacity: vec![permit],
+            child: Some(child),
             reader_task: None,
             stderr_task: None,
+            cancel_task: None,
+            cancellations: None,
             writer: Arc::new(Mutex::new(BufWriter::new(Box::new(stdin)))),
             responses: responses.clone(),
             next_id: AtomicU64::new(1),
@@ -114,31 +227,55 @@ impl McpConnection {
             alive: alive.clone(),
         };
 
+        let (sender, task) = super::cancellation::start(
+            connection.writer.clone(),
+            connection.owner.clone(),
+            alive.clone(),
+        );
+        connection.cancellations = Some(sender);
+        connection.cancel_task = Some(task);
         let server_name = connection.config.name.clone();
+        let reader_owner = connection.owner.clone();
         connection.reader_task = Some(tokio::spawn(async move {
             if let Err(e) =
                 Self::reader_task(BufReader::new(stdout), responses, alive, &server_name).await
             {
                 error!("MCP server '{}' reader failed: {}", server_name, e);
             }
-            let _ = reader_stop.send(true);
-            reader_done.notify_one();
+            if let Some(owner) = reader_owner {
+                owner.terminate();
+            }
         }));
 
         if let Some(stderr) = stderr {
             let server_name = connection.config.name.clone();
+            let stderr_owner = connection.owner.clone();
             connection.stderr_task = Some(tokio::spawn(async move {
-                let mut reader = stderr;
-                let mut bytes = [0u8; 4096];
-                // Bound diagnostics even when a child never writes a newline.
-                // Do not copy arbitrary child output (which may contain secrets)
-                // into persistent Portal logs.
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::new();
+                let mut budget = limits::OutputBudget::new(1024 * 1024);
+                let mut reported = false;
                 loop {
-                    match reader.read(&mut bytes).await {
+                    match limits::read_line(&mut reader, &mut line, 64 * 1024).await {
                         Ok(0) => break,
-                        Ok(n) => debug!("MCP server '{}' stderr: {} bytes", server_name, n),
+                        Ok(count) => {
+                            if budget.consume(count).is_err() {
+                                warn!("MCP server '{}' exceeded stderr output limit", server_name);
+                                if let Some(owner) = &stderr_owner {
+                                    owner.terminate();
+                                }
+                                break;
+                            }
+                            if !reported {
+                                warn!("MCP server '{}' wrote stderr; content omitted to protect credentials", server_name);
+                                reported = true;
+                            }
+                        }
                         Err(err) => {
                             warn!("MCP server '{}' stderr read failed: {}", server_name, err);
+                            if let Some(owner) = &stderr_owner {
+                                owner.terminate();
+                            }
                             break;
                         }
                     }
@@ -161,7 +298,7 @@ impl McpConnection {
 
     async fn reader_task<R>(
         reader: BufReader<R>,
-        responses: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+        responses: Arc<SyncMutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
         alive: Arc<AtomicBool>,
         server_name: &str,
     ) -> Result<()>
@@ -178,43 +315,52 @@ impl McpConnection {
 
     async fn read_responses<R>(
         mut reader: BufReader<R>,
-        responses: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+        responses: Arc<SyncMutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
         server_name: &str,
     ) -> Result<()>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
-        let mut partial = Vec::new();
+        let mut line = Vec::new();
+        let mut budget = limits::OutputBudget::new(16 * 1024 * 1024);
 
         loop {
-            let frame = crate::io_limits::read_frame(
-                &mut reader,
-                &mut partial,
-                crate::io_limits::MAX_FRAME_BYTES,
-            )
-            .await?;
-            let Some(line) = frame else {
+            let bytes_read = limits::read_line(&mut reader, &mut line, limits::MESSAGE_BYTES)
+                .await
+                .with_context(|| format!("Reading from MCP server '{}'", server_name))?;
+
+            if bytes_read == 0 {
                 debug!("MCP server '{}' connection closed", server_name);
                 break;
-            };
+            }
 
-            let trimmed = line.trim();
+            budget.consume(bytes_read)?;
+            let trimmed = std::str::from_utf8(&line)?.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
-            debug!("MCP server '{}' response received", server_name);
+            debug!(
+                "MCP server '{}' message ({} bytes)",
+                server_name,
+                trimmed.len()
+            );
 
             let response: JsonRpcResponse = match serde_json::from_str(trimmed) {
                 Ok(resp) => resp,
                 Err(e) => {
-                    warn!("MCP server '{}' sent invalid JSON: {}", server_name, e);
+                    warn!(
+                        "MCP server '{}' sent invalid JSON at line {}, column {}",
+                        server_name,
+                        e.line(),
+                        e.column()
+                    );
                     continue;
                 }
             };
 
             if let Some(id) = response.id {
-                let mut pending = responses.lock().await;
+                let mut pending = responses.lock().unwrap();
                 if let Some(sender) = pending.remove(&id) {
                     if sender.send(response).is_err() {
                         warn!(
@@ -237,10 +383,10 @@ impl McpConnection {
     }
 
     async fn drop_pending(
-        responses: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+        responses: Arc<SyncMutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
         server_name: &str,
     ) {
-        let mut pending = responses.lock().await;
+        let mut pending = responses.lock().unwrap();
         if !pending.is_empty() {
             warn!(
                 "MCP server '{}' reader closed: dropping {} pending response(s)",
@@ -264,7 +410,7 @@ impl McpConnection {
         let (tx, rx) = oneshot::channel();
 
         {
-            let mut pending = self.responses.lock().await;
+            let mut pending = self.responses.lock().unwrap();
             // Check under the same lock used by reader cleanup: either this
             // request is rejected, or cleanup will see and cancel it.
             if !self.is_alive() {
@@ -273,31 +419,63 @@ impl McpConnection {
                     self.config.name
                 );
             }
-            pending.retain(|_, sender| !sender.is_closed());
-            anyhow::ensure!(pending.len() < 32, "MCP request limit reached");
+            if pending.len() >= limits::PENDING_REQUESTS {
+                return Err(
+                    RequestRejected("MCP server is busy; too many pending requests").into(),
+                );
+            }
             pending.insert(request_id, tx);
         }
 
+        let mut pending_guard = PendingRequest {
+            connection: self,
+            id: request_id,
+            writing: false,
+            cancellable: method != "initialize",
+        };
         let request_json = serde_json::to_string(&request).with_context(|| {
             format!("Serializing request for MCP server '{}'", self.config.name)
         })?;
+        if request_json.len() > limits::MESSAGE_BYTES {
+            self.responses.lock().unwrap().remove(&request_id);
+            return Err(RequestRejected("MCP request exceeds the size limit").into());
+        }
 
         debug!("MCP server '{}' request: {}", self.config.name, method);
 
-        let write_result = tokio::time::timeout(crate::io_limits::WRITE_TIMEOUT, async {
+        let write = tokio::time::timeout(Duration::from_secs(5), async {
             let mut writer = self.writer.lock().await;
-            crate::io_limits::write_frame(&mut *writer, &request_json).await
+            pending_guard.writing = true;
+            let write_result = async {
+                writer
+                    .write_all(request_json.as_bytes())
+                    .await
+                    .with_context(|| format!("Writing to MCP server '{}'", self.config.name))?;
+                writer.write_all(b"\n").await.with_context(|| {
+                    format!("Writing newline to MCP server '{}'", self.config.name)
+                })?;
+                writer
+                    .flush()
+                    .await
+                    .with_context(|| format!("Flushing MCP server '{}'", self.config.name))?;
+                anyhow::Ok(())
+            }
+            .await;
+
+            if let Err(e) = write_result {
+                return Err(e);
+            }
+            Ok(())
         })
         .await;
-        if !matches!(write_result, Ok(Ok(()))) {
-            self.responses.lock().await.remove(&request_id);
-            self.alive.store(false, Ordering::SeqCst);
-            Self::drop_pending(self.responses.clone(), &self.config.name).await;
-            anyhow::bail!(
-                "MCP write failed or timed out; outcome unknown, do not automatically retry"
-            );
+        if !matches!(write, Ok(Ok(()))) {
+            self.responses.lock().unwrap().remove(&request_id);
+            // A cancelled partial JSON line cannot safely be resumed/retried.
+            self.abort();
+            anyhow::bail!("MCP request write failed or timed out");
         }
 
+        pending_guard.writing = false;
         let response = match tokio::time::timeout(timeout, rx).await {
             Ok(result) => result.with_context(|| {
                 let state = if self.is_alive() {
@@ -311,23 +489,17 @@ impl McpConnection {
                 )
             })?,
             Err(_) => {
-                // Clean up pending request on timeout
-                self.responses.lock().await.remove(&request_id);
-                anyhow::bail!(
-                    "Timeout ({}s) waiting for MCP server '{}'; outcome unknown, do not automatically retry",
-                    timeout.as_secs(),
-                    self.config.name
-                );
+                // The guard releases the slot and sends a bounded cancellation.
+                return Err(RequestTimeout(timeout.as_secs()).into());
             }
         };
 
         if let Some(error) = response.error {
-            anyhow::bail!(
-                "MCP server '{}' returned error: {} (code: {})",
-                self.config.name,
-                error.message,
-                error.code
-            );
+            return Err(RemoteError {
+                code: error.code,
+                message: error.message,
+            }
+            .into());
         }
 
         response.result.ok_or_else(|| {
@@ -354,12 +526,23 @@ impl McpConnection {
 
         debug!("MCP server '{}' notification: {}", self.config.name, method);
 
-        tokio::time::timeout(crate::io_limits::WRITE_TIMEOUT, async {
-            let mut writer = self.writer.lock().await;
-            crate::io_limits::write_frame(&mut *writer, &request_json).await
-        })
-        .await
-        .context("MCP notification write timed out")??;
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .with_context(|| {
+                format!("Writing notification to MCP server '{}'", self.config.name)
+            })?;
+        writer
+            .write_all(b"\n")
+            .await
+            .with_context(|| format!("Writing newline to MCP server '{}'", self.config.name))?;
+        writer.flush().await.with_context(|| {
+            format!(
+                "Flushing MCP server '{}' after notification",
+                self.config.name
+            )
+        })?;
 
         Ok(())
     }
@@ -367,23 +550,20 @@ impl McpConnection {
     async fn initialize(&self) -> Result<()> {
         debug!("Initializing MCP server '{}'", self.config.name);
 
-        let _init_result = self
-            .request(
-                "initialize",
-                serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "clientInfo": {
-                        "name": "heart-cortex",
-                        "version": "1.0.0"
-                    }
-                }),
-            )
-            .await?;
-
-        debug!("MCP server '{}' initialized", self.config.name);
+        self.request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "clientInfo": {
+                    "name": "heart-cortex",
+                    "version": "1.0.0"
+                }
+            }),
+        )
+        .await?;
 
         self.notify("notifications/initialized", serde_json::json!({}))
             .await?;
@@ -403,12 +583,22 @@ impl McpConnection {
             )
         })?;
 
+        anyhow::ensure!(tools.len() <= 128, "MCP server declared too many tools");
         let mut parsed_tools = Vec::new();
         for tool in tools {
             let tool_info: McpToolInfo =
                 serde_json::from_value(tool.clone()).with_context(|| {
                     format!("Parsing tool info from MCP server '{}'", self.config.name)
                 })?;
+            anyhow::ensure!(
+                !tool_info.name.is_empty()
+                    && tool_info.name.len() <= 128
+                    && tool_info
+                        .name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')),
+                "MCP server declared an invalid tool name"
+            );
             parsed_tools.push(tool_info);
         }
 
@@ -438,8 +628,9 @@ impl McpConnection {
             )
             .await?;
 
+        // Tool bodies can contain credentials and private service data.
         debug!(
-            "Tool '{}' on MCP server '{}' returned",
+            "Tool '{}' on MCP server '{}' completed",
             tool_name, self.config.name
         );
         Ok(result)
@@ -450,14 +641,49 @@ impl McpConnection {
         self.alive.load(Ordering::SeqCst)
     }
 
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(Child::id)
+    }
+
+    pub(crate) fn set_capacity(&mut self, permits: Vec<tokio::sync::OwnedSemaphorePermit>) {
+        self.capacity.extend(permits);
+    }
+
+    /// Synchronous ownership cleanup remains available when async tasks stall.
+    pub(crate) fn abort(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        if let Some(owner) = &self.owner {
+            owner.terminate();
+        }
+    }
+
     /// Shutdown the child process.
     pub async fn shutdown(&mut self) -> Result<()> {
         debug!("Shutting down MCP server '{}'", self.config.name);
+        if let Some(task) = self.cancel_task.take() {
+            task.abort();
+        }
+        self.cancellations = None;
+        if self.is_alive() {
+            let closed = if let Ok(mut writer) = self.writer.try_lock() {
+                *writer = BufWriter::new(Box::new(tokio::io::sink()));
+                true
+            } else {
+                false
+            };
+            if closed {
+                if let Some(child) = &mut self.child {
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                }
+            }
+        }
+        // Force cleanup after the grace period, before waiting for pipes/locks.
+        self.abort();
 
         // Publish the shutdown while holding the response-map lock used by new
         // requests, so none can slip in and wait on a connection being closed.
         {
-            let mut pending = self.responses.lock().await;
+            let mut pending = self.responses.lock().unwrap();
             self.alive.store(false, Ordering::SeqCst);
             if !pending.is_empty() {
                 debug!(
@@ -469,28 +695,53 @@ impl McpConnection {
             pending.clear();
         }
 
-        // Stop before acquiring stdin: a blocked writer must not block cleanup.
-        let _ = self.stop.send(true);
-        let cleanup = if let Some(mut task) = self.child_task.take() {
-            match tokio::time::timeout(Duration::from_secs(8), &mut task).await {
-                Ok(result) => result.context("Joining MCP process owner")?,
+        // Drop the child's stdin pipe first. This lets line-oriented servers
+        // observe EOF and, on Windows, avoids retaining a pipe handle after the
+        // process tree has been terminated.
+        {
+            let mut writer = self.writer.lock().await;
+            if let Err(e) = writer.shutdown().await {
+                warn!(
+                    "Failed to close stdin for MCP server '{}': {}",
+                    self.config.name, e
+                );
+            }
+            *writer = BufWriter::new(Box::new(tokio::io::sink()));
+        }
+
+        if let Some(mut child) = self.child.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(status)) => {
+                    debug!(
+                        "MCP server '{}' process exited with status: {}",
+                        self.config.name, status
+                    );
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "Error waiting for MCP server '{}' process: {}",
+                        self.config.name, e
+                    );
+                }
                 Err(_) => {
-                    task.abort();
-                    let _ = task.await;
-                    Err(anyhow::anyhow!(
-                        "MCP process cleanup not confirmed; outcome unknown"
-                    ))
+                    warn!(
+                        "Timeout waiting for MCP server '{}' process to exit",
+                        self.config.name
+                    );
+                    if let Err(e) = child.kill().await {
+                        warn!(
+                            "Failed to kill MCP server '{}' process: {}",
+                            self.config.name, e
+                        );
+                    } else if let Err(e) = child.wait().await {
+                        warn!(
+                            "Error reaping MCP server '{}' process: {}",
+                            self.config.name, e
+                        );
+                    }
                 }
             }
-        } else {
-            Ok(())
-        };
-        // The terminated child releases a blocked writer; bound the lock too.
-        let _ = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut writer = self.writer.lock().await;
-            *writer = BufWriter::new(Box::new(tokio::io::sink()));
-        })
-        .await;
+        }
 
         // Child processes may still be releasing inherited stdout/stderr handles
         // after their launcher exits. Await the readers so Windows releases the
@@ -502,20 +753,20 @@ impl McpConnection {
             finish_io_task(stderr_task, "stderr", &self.config.name),
         );
 
-        cleanup
+        Ok(())
     }
 }
 
 impl Drop for McpConnection {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
-        if let Some(task) = self.child_task.take() {
+        self.abort();
+        if let Some(task) = &self.cancel_task {
             task.abort();
         }
-        if let Some(task) = self.reader_task.take() {
+        if let Some(task) = &self.reader_task {
             task.abort();
         }
-        if let Some(task) = self.stderr_task.take() {
+        if let Some(task) = &self.stderr_task {
             task.abort();
         }
     }
@@ -551,15 +802,73 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn cancelled_call_releases_pending_slot_without_killing_healthy_connection() {
+        use tokio::io::AsyncBufReadExt;
+        let (writer, peer) = tokio::io::duplex(4096);
+        let connection = Arc::new(McpConnection {
+            owner: None,
+            capacity: Vec::new(),
+            child: None,
+            reader_task: None,
+            stderr_task: None,
+            cancel_task: None,
+            cancellations: None,
+            writer: Arc::new(Mutex::new(BufWriter::new(Box::new(writer)))),
+            responses: Arc::new(SyncMutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            config: McpServerConfig {
+                name: "cancelled".into(),
+                command: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+            alive: Arc::new(AtomicBool::new(true)),
+        });
+        let mut peer = BufReader::new(peer);
+        // More cancellations than the pending limit must not exhaust admission.
+        for _ in 0..20 {
+            let calling = connection.clone();
+            let task =
+                tokio::spawn(
+                    async move { calling.call_tool("example", serde_json::json!({})).await },
+                );
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), peer.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(connection.responses.lock().unwrap().is_empty());
+            assert!(connection.is_alive());
+        }
+        let mut line = String::new();
+        let (result, _) = tokio::join!(
+            connection.request_with_timeout(
+                "tools/call",
+                serde_json::json!({}),
+                Duration::from_millis(10)
+            ),
+            peer.read_line(&mut line),
+        );
+        assert!(result.unwrap_err().is::<RequestTimeout>());
+        assert!(connection.responses.lock().unwrap().is_empty());
+        assert!(connection.is_alive());
+    }
+
+    #[tokio::test]
     async fn request_after_reader_closed_fails_without_waiting_or_writing() {
         let (writer, mut peer) = tokio::io::duplex(4096);
         let connection = McpConnection {
-            child_task: None,
-            stop: tokio::sync::watch::channel(false).0,
+            owner: None,
+            capacity: Vec::new(),
+            child: None,
             reader_task: None,
             stderr_task: None,
+            cancel_task: None,
+            cancellations: None,
             writer: Arc::new(Mutex::new(BufWriter::new(Box::new(writer)))),
-            responses: Arc::new(Mutex::new(HashMap::new())),
+            responses: Arc::new(SyncMutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             config: McpServerConfig {
                 name: "closed-reader".into(),
@@ -587,7 +896,7 @@ mod tests {
         .expect("closed reader must fail immediately")
         .unwrap_err();
         assert!(error.to_string().contains("closed stdout"), "{error}");
-        assert!(connection.responses.lock().await.is_empty());
+        assert!(connection.responses.lock().unwrap().is_empty());
         drop(connection);
         let mut output = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut peer, &mut output)
@@ -601,56 +910,52 @@ mod tests {
     async fn cmd_kit_handles_spaces_and_literal_metacharacters() {
         let dir = std::env::temp_dir().join(format!("portal kit ({})", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
+        let _fixture_dir = crate::kits::tests::TestKits(dir.clone());
         let script = dir.join("kit shim.cmd");
         std::fs::write(
             &script,
             concat!(
                 "@echo off\r\n",
-                "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"%~dp0server.ps1\" %*\r\n",
+                "set \"PORTAL_TEST_KIT_TOKEN=%~1\"\r\n",
+                "\"%PORTAL_TEST_KIT_BINARY%\" --exact kits::tests::mcp_fixture --nocapture --quiet\r\n",
             ),
         )
         .unwrap();
-        // A real line reader: consecutive `set /p` in cmd can consume multiple
-        // pipe lines at once, making a batch-only MCP fixture nondeterministic.
-        std::fs::write(
-            dir.join("server.ps1"),
-            r#"
-$ErrorActionPreference = 'Stop'
-while ($null -ne ($line = [Console]::ReadLine())) {
-    $request = ConvertFrom-Json -InputObject $line
-    if ($null -ne $request.id) {
-        $result = @{ argument = $args[0] }
-        $response = @{ jsonrpc = '2.0'; id = $request.id; result = $result }
-        [Console]::WriteLine((ConvertTo-Json -InputObject $response -Compress -Depth 5))
-    }
-}
-"#,
-        )
-        .unwrap();
+        // Reuse the native MCP fixture so this argument-quoting regression does
+        // not depend on PowerShell's cold startup or module discovery on CI.
         let mut connection = McpConnection::spawn(McpServerConfig {
             name: "cmd-test".into(),
             command: vec![
                 script.to_string_lossy().into_owned(),
                 "space & value".into(),
             ],
-            env: HashMap::new(),
+            env: HashMap::from([
+                ("PORTAL_TEST_KIT_FIXTURE".into(), "1".into()),
+                (
+                    "PORTAL_TEST_KIT_BINARY".into(),
+                    std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                ),
+            ]),
             cwd: Some(dir.clone()),
         })
         .await
         .unwrap();
         let result = connection
-            .request_with_timeout("ping", serde_json::json!({}), Duration::from_secs(5))
+            .request_with_timeout(
+                "tools/call",
+                serde_json::json!({"name": "ping", "arguments": {}}),
+                Duration::from_secs(5),
+            )
             .await;
         connection.shutdown().await.unwrap();
-        assert_eq!(result.unwrap()["argument"], "space & value");
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(result.unwrap()["token"], "space & value");
     }
 
     #[tokio::test]
     async fn closed_reader_drops_pending_on_eof_and_read_error() {
         for input in [&b""[..], &b"\xff\n"[..]] {
             let (sender, receiver) = oneshot::channel();
-            let responses = Arc::new(Mutex::new(HashMap::from([(1, sender)])));
+            let responses = Arc::new(SyncMutex::new(HashMap::from([(1, sender)])));
             let alive = Arc::new(AtomicBool::new(true));
             let result = McpConnection::reader_task(
                 BufReader::new(input),
@@ -661,96 +966,8 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             .await;
             assert_eq!(result.is_err(), !input.is_empty());
             assert!(!alive.load(Ordering::SeqCst));
-            assert!(responses.lock().await.is_empty());
+            assert!(responses.lock().unwrap().is_empty());
             assert!(receiver.await.is_err());
         }
-    }
-}
-
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-    // These fixtures run only in subprocesses explicitly launched by the test.
-    #[test]
-    #[ignore]
-    fn orphan_fixture() {
-        let Ok(marker) = std::env::var("PORTAL_TEST_ORPHAN_MARKER") else {
-            return;
-        };
-        std::thread::sleep(Duration::from_secs(2));
-        std::fs::write(marker, "orphan survived").unwrap();
-    }
-    #[test]
-    #[ignore]
-    fn server_fixture() {
-        use std::io::{BufRead, Write};
-        if std::env::var_os("PORTAL_TEST_ORPHAN_MARKER").is_none() {
-            return;
-        }
-        for line in std::io::stdin().lock().lines() {
-            let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
-            if value.get("id").is_none() {
-                continue;
-            }
-            let finish = value["method"] == "tools/call";
-            if finish {
-                let _child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--ignored",
-                        "--exact",
-                        "mcp::connection::lifecycle_tests::orphan_fixture",
-                        "--nocapture",
-                    ])
-                    .spawn()
-                    .unwrap();
-            }
-            println!(
-                "\n{}",
-                serde_json::json!({"jsonrpc":"2.0","id":value["id"],"result":
-                if finish { serde_json::json!({"content":[{"type":"text","text":"final response"}]}) }
-                else { serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}) }})
-            );
-            std::io::stdout().flush().unwrap();
-            if finish {
-                std::process::exit(0);
-            }
-        }
-    }
-    #[tokio::test]
-    async fn mcp_exit_drains_final_reply_and_stops_inherited_children() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker = temp.path().join("orphan");
-        let mut connection = McpConnection::spawn(McpServerConfig {
-            name: "lifecycle-fixture".into(),
-            command: vec![
-                std::env::current_exe()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-                "--ignored".into(),
-                "--exact".into(),
-                "mcp::connection::lifecycle_tests::server_fixture".into(),
-                "--nocapture".into(),
-            ],
-            env: HashMap::from([(
-                "PORTAL_TEST_ORPHAN_MARKER".into(),
-                marker.to_string_lossy().into_owned(),
-            )]),
-            cwd: Some(temp.path().to_path_buf()),
-        })
-        .await
-        .unwrap();
-        let reply = connection
-            .call_tool("finish", serde_json::json!({}))
-            .await
-            .unwrap();
-        assert_eq!(reply["content"][0]["text"], "final response");
-        tokio::time::sleep(Duration::from_millis(2200)).await;
-        assert!(
-            !marker.exists(),
-            "MCP descendant survived the leader's exit"
-        );
-        assert!(!connection.is_alive());
-        connection.shutdown().await.unwrap();
     }
 }

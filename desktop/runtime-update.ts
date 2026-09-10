@@ -91,11 +91,16 @@ export class RuntimeUpdater {
     // A newer independently installed engine remains newer, but its old
     // supervisor is still stopped and replaced by the current client runner.
     const packageId = bundle.id;
+    let legacyProcessHealth = false;
     for (const service of [previous, ...additional]) {
       const oldBinary = service.binary || (service.existing ? settings.portalBinary : path.join(service.root, this.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'));
       const oldVersion = await this.version(oldBinary);
       if (compareVersions(oldVersion, bundle.portalVersion) > 0) {
-        const sha256 = digest(await readFile(oldBinary));
+        const bytes = await readFile(oldBinary);
+        const sha256 = digest(bytes);
+        // Upstream builds may predate our structured telemetry interface even
+        // when their version is newer. Never downgrade them to gain telemetry.
+        legacyProcessHealth = !bytes.includes(Buffer.from('HEART_PORTAL_STATUS_FILE'));
         binary = oldBinary;
         bundle = { ...bundle, portalVersion: oldVersion, sha256, id: digest(Buffer.from(`${packageId}:${sha256}`)) };
       }
@@ -106,7 +111,7 @@ export class RuntimeUpdater {
     const wasEnabled = previous.kind === 'portable' || (await this.background.refresh()).enabled;
     const root = path.join(this.directory, 'portal-service', randomUUID());
     const candidate: Service = { label: previous.label, file: previous.kind === 'portable' ? path.join(root, 'launch.plist') : previous.file, root, existing: false, login: previous.login,
-      name: primary.name || settings.portalName, environment: primary.environment, bundleId: bundle.id, configPath: config, cwd: primary.cwd || (primary.existing ? primary.root : settings.workspace),
+      name: primary.name || settings.portalName, environment: primary.environment, bundleId: bundle.id, legacyProcessHealth, configPath: config, cwd: primary.cwd || (primary.existing ? primary.root : settings.workspace),
       fingerprint: fingerprint({ ...settings, portalBinary: path.join(root, this.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'), portalConfigPath: config, workspace: primary.cwd || settings.workspace, portalEnvironmentPath: primary.environment?.PATH || settings.portalEnvironmentPath, portalName: primary.name || settings.portalName }, connection) };
     await mkdir(root, { recursive: true, mode: 0o700 });
     try {
@@ -150,7 +155,13 @@ export class RuntimeUpdater {
       const nonce = await readFile(path.join(service.root, '.portal-status-nonce'), 'utf8').catch(() => '');
       const sample = state.running && state.pid ? await readPortalSample(path.join(service.root, '.portal-connection-status.json'), state.pid, nonce.trim()) : null;
       // Cloud availability is not an installation health test.
-      if (sample && !['starting', 'invalid'].includes(sample.state)) {
+      if (service.legacyProcessHealth && state.running && state.pid) {
+        // OS-owned engine PID must stay alive across the supervisor's restart
+        // interval. This proves local startup only, never relay connectivity.
+        const current = String(state.pid);
+        if (identity !== current) { identity = current; since = Date.now(); }
+        if (Date.now() - since >= 6000) return;
+      } else if (sample && !['starting', 'invalid'].includes(sample.state)) {
         const current = `${sample.pid}:${sample.boot_id}`;
         if (identity !== current) { identity = current; since = Date.now(); }
         if (Date.now() - since >= 2000) return;

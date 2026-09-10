@@ -35,6 +35,8 @@ async function fixture(platform: 'darwin' | 'win32' = 'darwin') {
   const background = new BackgroundPortal(profile, run, platform, root);
   await background.enable(settings, connection);
   const previous = { ...background.installedService! };
+  // Commands are mocked; do not deep-compare the host's 100 MB Node executable.
+  await writeFile(path.join(previous.root, platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'), 'old executable');
   const original = 'name = "test"\nworkspace = "unchanged"\n# custom tools and settings must survive\n';
   await writeFile(previous.configPath!, original);
   const binary = path.join(root, 'new-engine'); await writeFile(binary, 'new executable');

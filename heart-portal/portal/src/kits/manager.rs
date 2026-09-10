@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -11,28 +12,28 @@ use tracing::{debug, info, warn};
 use crate::mcp::{McpConnection, McpServerConfig};
 use crate::tools::ToolInfo;
 
-use super::loader::{command_binary_exists, format_command, LoadedKit};
+use super::environment::EnvStatus;
+use super::loader::{command_binary_exists, format_command, KitScan, LoadedKit};
 
 const MAX_FAILURES: u8 = 3;
 const SPAWN_TIMEOUT_SECS: u64 = 30;
 /// After a kit is marked unhealthy, wait this long before giving it another
 /// chance so a transient failure does not require a Portal restart to recover.
 const RECOVERY_COOLDOWN_SECS: u64 = 60;
-/// Directories prepended to a kit process's PATH so kits can find common
-/// toolchains (e.g. Homebrew-installed node/python) even when launched from a
-/// launchd/systemd context with a minimal PATH.
-#[cfg(unix)]
-const KIT_EXTRA_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 const WARMUP_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone)]
 pub struct KitManager {
     kits: Arc<Mutex<BTreeMap<String, KitState>>>,
+    connections: Arc<std::sync::Mutex<Vec<Weak<McpConnection>>>>,
+    retired: Arc<Mutex<tokio::task::JoinSet<()>>>,
+    stopping: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
 struct KitState {
-    connect_gate: Arc<Mutex<()>>,
+    process_slots: Arc<tokio::sync::Semaphore>,
+    start_lock: Arc<Mutex<()>>,
+    cancelled: tokio::sync::watch::Sender<bool>,
     kit: LoadedKit,
     /// Wrapped in `Arc` so a caller can clone the handle, release the manager
     /// lock, and perform the MCP call without blocking other kits.
@@ -44,14 +45,66 @@ struct KitState {
     last_failure_at: Option<Instant>,
     /// Calls since last `portal_kit_usage` drain
     unsent_calls: u64,
+    diagnostics: KitDiagnostics,
 }
 
-#[derive(Debug, Clone)]
+/// Only Portal-observed metadata; never kit responses, arguments or credentials.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KitDiagnostics {
+    pub generation: String,
+    pub last_started_at_unix_ms: Option<u64>,
+    pub last_start_duration_ms: Option<u64>,
+    pub last_lifecycle_error: Option<&'static str>,
+    pub last_call: Option<KitCallStatus>,
+}
+
+impl KitDiagnostics {
+    fn new(missing_runtime: bool) -> Self {
+        Self {
+            generation: uuid::Uuid::new_v4().to_string(),
+            last_started_at_unix_ms: None,
+            last_start_duration_ms: None,
+            last_lifecycle_error: missing_runtime.then_some("runtime-not-found"),
+            last_call: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KitCallStatus {
+    pub outcome: &'static str,
+    pub completed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct KitReloadReport {
+    pub added: Vec<String>,
+    pub reloaded: Vec<String>,
+    pub removed: Vec<String>,
+    /// Invalid/partially written manifests do not evict a working kit.
+    pub retained_invalid: Vec<String>,
+}
+
+impl KitReloadReport {
+    pub fn changed(&self) -> bool {
+        !self.added.is_empty() || !self.reloaded.is_empty() || !self.removed.is_empty()
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct KitStatus {
     pub name: String,
     pub version: String,
     pub tools: usize,
     pub status: String,
+    pub configuration_error: Option<String>,
+    pub env_file: String,
+    pub env: Vec<EnvStatus>,
+    pub auth: super::auth::AuthState,
+    pub process_id: Option<u32>,
+    pub diagnostics: KitDiagnostics,
+    pub next_action: &'static str,
+    pub service_authorization: &'static str,
 }
 
 impl KitManager {
@@ -77,22 +130,31 @@ impl KitManager {
             states.insert(
                 name,
                 KitState {
-                    connect_gate: Arc::new(Mutex::new(())),
                     kit,
                     connection: None,
                     failure_count: 0,
                     unhealthy: pre_unhealthy,
                     last_failure_at: None,
                     unsent_calls: 0,
+                    diagnostics: KitDiagnostics::new(pre_unhealthy),
+                    process_slots: Arc::new(tokio::sync::Semaphore::new(
+                        crate::mcp::limits::KIT_GENERATIONS,
+                    )),
+                    start_lock: Arc::new(Mutex::new(())),
+                    cancelled: tokio::sync::watch::channel(false).0,
                 },
             );
         }
 
         Self {
             kits: Arc::new(Mutex::new(states)),
+            connections: Arc::new(std::sync::Mutex::new(Vec::new())),
+            retired: Arc::new(Mutex::new(tokio::task::JoinSet::new())),
+            stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    #[cfg(test)]
     pub async fn list_tools(&self) -> Vec<ToolInfo> {
         let kits = self.kits.lock().await;
         let mut tools = Vec::new();
@@ -107,38 +169,161 @@ impl KitManager {
     pub async fn list_healthy_tools(&self) -> Vec<ToolInfo> {
         let mut kits = self.kits.lock().await;
         let mut tools = Vec::new();
-
         for state in kits.values_mut() {
             recover_if_cooled_down(state);
-
-            // A kit can exit independently while Portal and the relay stay
-            // connected. Reap the stale connection here so health/tool
-            // discovery reflects the kit's real state and gives it a bounded
-            // number of restart attempts instead of advertising a dead route.
-            let dead_connection = state
-                .connection
-                .as_ref()
-                .map(|connection| !connection.is_alive())
-                .unwrap_or(false);
-            if dead_connection {
-                drop_connection(state).await;
-                record_failure(state);
+            if !state.unhealthy && state.kit.configuration_error().is_none() {
+                push_kit_tools(state, &mut tools);
             }
-
-            if state.unhealthy {
-                continue;
-            }
-            push_kit_tools(state, &mut tools);
         }
-
         tools
+    }
+
+    async fn connection_for(
+        &self,
+        name: &str,
+        generation: &str,
+        seconds: u64,
+    ) -> Result<Arc<McpConnection>> {
+        anyhow::ensure!(
+            !self.stopping.load(Ordering::Acquire),
+            "Portal is shutting down"
+        );
+        let gate = {
+            let kits = self.kits.lock().await;
+            kits.get(name)
+                .context("Kit was removed")?
+                .start_lock
+                .clone()
+        };
+        let _guard = timeout(Duration::from_secs(5), gate.lock())
+            .await
+            .context("Kit is already starting; retry later")?;
+        // Copy only spawn inputs. Runtime counters and diagnostics remain in the
+        // registry and are updated only after confirming this generation still owns it.
+        let (config, old_connection, kit_permit, mut cancelled) = {
+            let mut kits = self.kits.lock().await;
+            let state = kits.get_mut(name).context("Kit was removed")?;
+            anyhow::ensure!(
+                state.diagnostics.generation == generation,
+                "Kit was reloaded; retry with its current tools"
+            );
+            if let Some(connection) = state.connection.as_ref().filter(|c| c.is_alive()) {
+                return Ok(connection.clone());
+            }
+            check_startable(state)?;
+            let kit_permit = state.process_slots.clone().try_acquire_owned()
+                .context("This kit still has two process generations in use; let its old calls finish before retrying")?;
+            let config = McpServerConfig {
+                name: name.to_owned(),
+                command: state.kit.command.clone(),
+                env: kit_env(state),
+                cwd: Some(state.kit.kit_dir.clone()),
+            };
+            (
+                config,
+                state.connection.take(),
+                kit_permit,
+                state.cancelled.subscribe(),
+            )
+        };
+        anyhow::ensure!(
+            !*cancelled.borrow(),
+            "Kit startup cancelled by reload or shutdown"
+        );
+        if let Some(connection) = old_connection {
+            connection.abort();
+            if let Ok(mut owned) = Arc::try_unwrap(connection) {
+                let _ = timeout(Duration::from_secs(5), owned.shutdown()).await;
+            }
+        }
+        let command_text = format_command(&config.command);
+        info!("Spawning kit '{}'", name);
+        let started_at = unix_ms();
+        let starting = Instant::now();
+        let result = tokio::select! {
+            biased;
+            _ = cancelled.changed() => anyhow::bail!("Kit startup cancelled by reload or shutdown"),
+            result = timeout(Duration::from_secs(seconds), McpConnection::spawn(config)) => result,
+        };
+        let duration_ms = starting.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let mut kits = self.kits.lock().await;
+        let current = kits
+            .get_mut(name)
+            .filter(|state| state.diagnostics.generation == generation);
+        let Some(state) = current.filter(|_| !self.stopping.load(Ordering::Acquire)) else {
+            if let Ok(Ok(connection)) = &result {
+                connection.abort();
+            }
+            anyhow::bail!("Kit was reloaded, removed or Portal is shutting down");
+        };
+        state.diagnostics.last_start_duration_ms = Some(duration_ms);
+        match result {
+            Ok(Ok(mut connection)) => {
+                connection.set_capacity(vec![kit_permit]);
+                let connection = Arc::new(connection);
+                debug!("Kit '{}' spawned", name);
+                state.diagnostics.last_started_at_unix_ms = Some(started_at);
+                state.diagnostics.last_lifecycle_error = None;
+                state.diagnostics.last_call = None;
+                let mut connections = self.connections.lock().unwrap();
+                connections.retain(|c| c.strong_count() > 0);
+                connections.push(Arc::downgrade(&connection));
+                state.connection = Some(connection.clone());
+                Ok(connection)
+            }
+            failure => {
+                let (code, error) = match failure {
+                    Ok(Err(error)) => ("mcp-start-failed", error.to_string()),
+                    Err(_) => (
+                        "mcp-start-timeout",
+                        format!("timed out after {} seconds", seconds),
+                    ),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                state.diagnostics.last_lifecycle_error = Some(code);
+                record_failure(state);
+                warn!(
+                    "Kit '{}' failed MCP startup; details returned to caller",
+                    name
+                );
+                anyhow::bail!(
+                    "Kit '{}' failed to start: {}. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+                    name, error, command_text
+                )
+            }
+        }
+    }
+
+    async fn retire(&self, connection: Arc<McpConnection>) {
+        let connection = match Arc::try_unwrap(connection) {
+            Ok(mut owned) => {
+                let _ = timeout(Duration::from_secs(5), owned.shutdown()).await;
+                return;
+            }
+            Err(shared) => shared,
+        };
+        let mut retired = self.retired.lock().await;
+        while retired.try_join_next().is_some() {}
+        retired.spawn(async move {
+            let mut connection = connection;
+            loop {
+                match Arc::try_unwrap(connection) {
+                    Ok(mut owned) => {
+                        let _ = timeout(Duration::from_secs(5), owned.shutdown()).await;
+                        return;
+                    }
+                    Err(shared) => connection = shared,
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
     }
 
     pub async fn resolve_tool(&self, tool_name: &str) -> Option<(String, String)> {
         let kits = self.kits.lock().await;
         for state in kits.values() {
             for tool in &state.kit.manifest.tools {
-                let routed_name = format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name);
+                let routed_name = super::loader::tool_route(&state.kit.manifest.name, &tool.name);
                 let normalized_query = tool_name.replace('-', "_");
                 if routed_name == normalized_query {
                     return Some((state.kit.manifest.name.clone(), tool.name.clone()));
@@ -154,21 +339,24 @@ impl KitManager {
         tool_name: &str,
         mut arguments: Value,
     ) -> Result<Value> {
-        let params = {
+        let (params, generation) = {
             let kits = self.kits.lock().await;
-            let state = kits
-                .get(kit_name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown kit: {kit_name}"))?;
-            state
+            let state = kits.get(kit_name).context("Unknown kit")?;
+            let params = state
                 .kit
                 .manifest
                 .tools
                 .iter()
                 .find(|tool| tool.name == tool_name)
-                .map(|tool| tool.params.clone())
-                .ok_or_else(|| anyhow::anyhow!("Unknown kit tool: {tool_name}"))?
+                .context("Unknown kit tool")?
+                .params
+                .clone();
+            (params, state.diagnostics.generation.clone())
         };
-        let connection = self.connection(kit_name, SPAWN_TIMEOUT_SECS).await?;
+        let connection = self
+            .connection_for(kit_name, &generation, SPAWN_TIMEOUT_SECS)
+            .await?;
+
         // Heart's act DSL passes all parameter values as JSON strings; coerce
         // them to the types declared in the kit tool's JSON Schema before the
         // MCP call so kit-side validation does not reject e.g. limit="3".
@@ -176,34 +364,89 @@ impl KitManager {
 
         // Phase 2: perform the MCP call WITHOUT holding the manager lock.
         let result = connection.call_tool(tool_name, arguments).await;
-        // Release our handle so `drop_connection` below can reclaim ownership
-        // (via `Arc::try_unwrap`) to cleanly shut down a failed connection.
-        // Phase 3: re-acquire the lock only to update health bookkeeping.
-        let mut kits = self.kits.lock().await;
-        match kits.get_mut(kit_name) {
-            Some(state)
-                if state
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<crate::mcp::RequestRejected>())
+        {
+            return result;
+        }
+        let request_failure = result.as_ref().err().and_then(|error| {
+            if error.is::<crate::mcp::RequestTimeout>() {
+                Some("timeout")
+            } else if error.is::<crate::mcp::RemoteError>() {
+                Some("request-error")
+            } else {
+                None
+            }
+        });
+        if let Some(outcome) = request_failure {
+            let mut kits = self.kits.lock().await;
+            if let Some(state) = kits.get_mut(kit_name).filter(|state| {
+                state
                     .connection
                     .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &connection)) =>
-            {
-                match result {
-                    Ok(value) => {
-                        state.failure_count = 0;
-                        state.unsent_calls += 1;
-                        Ok(value)
-                    }
-                    Err(err) => {
-                        warn!("Kit '{}' tool '{}' failed: {}", kit_name, tool_name, err);
-                        drop_connection(state).await;
-                        record_failure(state);
-                        Err(err).with_context(|| {
-                            format!("Failed to call kit '{}' tool '{}'", kit_name, tool_name)
-                        })
-                    }
+                    .is_some_and(|active| Arc::ptr_eq(active, &connection))
+            }) {
+                state.diagnostics.last_call = Some(KitCallStatus {
+                    outcome,
+                    completed_at_unix_ms: unix_ms(),
+                });
+            }
+            return result;
+        }
+        // Phase 3: re-acquire the lock only to update health bookkeeping.
+        let mut kits = self.kits.lock().await;
+        // An old in-flight call must never reset health or close the replacement
+        // process after a reload (including remove + reinstall with the same name).
+        let current = kits
+            .get(kit_name)
+            .and_then(|state| state.connection.as_ref())
+            .is_some_and(|active| Arc::ptr_eq(active, &connection));
+        drop(connection);
+        if !current {
+            if result.is_ok() {
+                if let Some(state) = kits.get_mut(kit_name) {
+                    state.unsent_calls += 1;
                 }
             }
-            _ => {
+            return result;
+        }
+        match kits.get_mut(kit_name) {
+            Some(state) => match result {
+                Ok(value) => {
+                    state.failure_count = 0;
+                    state.unsent_calls += 1;
+                    state.diagnostics.last_lifecycle_error = None;
+                    state.diagnostics.last_call = Some(KitCallStatus {
+                        outcome: if value.get("isError").and_then(Value::as_bool) == Some(true) {
+                            "tool-error"
+                        } else {
+                            "success"
+                        },
+                        completed_at_unix_ms: unix_ms(),
+                    });
+                    Ok(value)
+                }
+                Err(err) => {
+                    warn!("Kit '{}' tool '{}' MCP call failed", kit_name, tool_name);
+                    state.diagnostics.last_lifecycle_error = Some("mcp-call-failed");
+                    state.diagnostics.last_call = Some(KitCallStatus {
+                        outcome: "mcp-error",
+                        completed_at_unix_ms: unix_ms(),
+                    });
+                    let retired = state.connection.take();
+                    record_failure(state);
+                    drop(kits);
+                    if let Some(connection) = retired {
+                        connection.abort();
+                        self.retire(connection).await;
+                    }
+                    Err(err).with_context(|| {
+                        format!("Failed to call kit '{}' tool '{}'", kit_name, tool_name)
+                    })
+                }
+            },
+            None => {
                 warn!(
                     "Kit '{}' was removed during call_tool; returning Phase 2 result as-is",
                     kit_name
@@ -220,7 +463,11 @@ impl KitManager {
         let eager_names: Vec<String> = {
             let kits = self.kits.lock().await;
             kits.iter()
-                .filter(|(_, state)| state.kit.manifest.eager == Some(true) && !state.unhealthy)
+                .filter(|(_, state)| {
+                    state.kit.manifest.eager == Some(true)
+                        && !state.unhealthy
+                        && state.kit.configuration_error().is_none()
+                })
                 .map(|(name, _)| name.clone())
                 .collect()
         };
@@ -231,71 +478,63 @@ impl KitManager {
 
         info!("Warming up {} eager kit(s)", eager_names.len());
 
-        // Phase 2: spawn each kit one at a time, releasing the lock between attempts
-        // so other callers are not blocked for the full warmup window.
         for name in eager_names {
-            match self.connection(&name, WARMUP_TIMEOUT_SECS).await {
-                Ok(_) => info!("Warmed up eager kit '{name}'"),
-                Err(error) => warn!("Failed to warm up '{name}': {error}"),
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let generation = {
+                let kits = self.kits.lock().await;
+                kits.get(&name)
+                    .filter(|s| s.kit.manifest.eager == Some(true))
+                    .map(|s| s.diagnostics.generation.clone())
+            };
+            if let Some(generation) = generation {
+                match self
+                    .connection_for(&name, &generation, WARMUP_TIMEOUT_SECS)
+                    .await
+                {
+                    Ok(_) => info!("Warmed up eager kit '{}'", name),
+                    Err(_) => warn!(
+                        "Eager kit '{}' is unavailable; Portal remains running",
+                        name
+                    ),
+                }
             }
         }
     }
 
-    async fn connection(&self, name: &str, timeout_secs: u64) -> Result<Arc<McpConnection>> {
-        let gate = self
-            .kits
-            .lock()
-            .await
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown kit: {name}"))?
-            .connect_gate
-            .clone();
-        let _connecting = gate.lock().await;
-        let mut snapshot = self
-            .kits
-            .lock()
-            .await
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Kit removed: {name}"))?
-            .clone();
-        anyhow::ensure!(
-            Arc::ptr_eq(&gate, &snapshot.connect_gate),
-            "Kit changed; retry discovery"
-        );
-        let result = ensure_connection_with_timeout(&mut snapshot, timeout_secs).await;
-        let mut kits = self.kits.lock().await;
-        let state = kits
-            .get_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("Kit removed: {name}"))?;
-        anyhow::ensure!(
-            Arc::ptr_eq(&gate, &state.connect_gate),
-            "Kit changed during startup"
-        );
-        state.connection = snapshot.connection;
-        state.failure_count = snapshot.failure_count;
-        state.last_failure_at = snapshot.last_failure_at;
-        state.unhealthy = snapshot.unhealthy;
-        result?;
-        state
-            .connection
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Kit has no connection"))
-    }
-
     pub async fn shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
         let connections = {
             let mut kits = self.kits.lock().await;
             kits.values_mut()
                 .filter_map(|state| {
-                    state.connect_gate = Arc::new(Mutex::new(()));
+                    state.cancelled.send_replace(true);
                     state.connection.take()
                 })
                 .collect::<Vec<_>>()
         };
+        // Includes retired connections still held by in-flight tool calls.
+        for connection in self
+            .connections
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            connection.abort();
+        }
         for connection in connections {
-            if let Ok(mut connection) = Arc::try_unwrap(connection) {
-                let _ = connection.shutdown().await;
-            }
+            self.retire(connection).await;
+        }
+        let mut retired = self.retired.lock().await;
+        if timeout(Duration::from_secs(5), async {
+            while retired.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            retired.shutdown().await;
         }
         info!("Kit processes shut down");
     }
@@ -308,18 +547,140 @@ impl KitManager {
                 version: state.kit.manifest.version.clone(),
                 tools: state.kit.manifest.tools.len(),
                 status: status_text(state).to_string(),
+                configuration_error: state.kit.configuration_error().map(str::to_owned),
+                env_file: state
+                    .kit
+                    .kit_dir
+                    .join(".env")
+                    .to_string_lossy()
+                    .into_owned(),
+                env: state.kit.environment.statuses(&state.kit.manifest),
+                auth: state.kit.auth.clone(),
+                process_id: state
+                    .connection
+                    .as_ref()
+                    .filter(|c| c.is_alive())
+                    .and_then(|c| c.process_id()),
+                diagnostics: state.diagnostics.clone(),
+                next_action: next_action(state),
+                service_authorization: "not-verified-by-portal",
             })
             .collect()
+    }
+
+    /// Return known, non-secret setup metadata, never the raw manifest/defaults
+    /// or arbitrary extension values. Commands/URLs are instructions, not run here.
+    pub async fn setup(&self, kit_name: &str) -> Result<Value> {
+        let kits = self.kits.lock().await;
+        let state = kits
+            .get(kit_name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown kit: {}", kit_name))?;
+        let kit = &state.kit;
+        let provision = kit.manifest.provision.clone().unwrap_or_default();
+        Ok(serde_json::json!({
+            "kit": kit.manifest.name,
+            "version": kit.manifest.version,
+            "status": status_text(state),
+            "configuration_error": kit.configuration_error(),
+            "directory": kit.kit_dir,
+            "env_file": kit.kit_dir.join(".env"),
+            "env": kit.environment.statuses(&kit.manifest),
+            "auth": kit.auth,
+            "authorization": "Verified by the kit/service when used; configuration checks do not validate token scopes or account permissions.",
+            "runtime": provision.runtime,
+            "legacy_runtime": kit.manifest.runtime,
+            "platforms": kit.manifest.platform.as_ref().unwrap_or(&provision.platforms),
+            "dependencies": provision.deps,
+            "install": provision.install,
+            "post_install": provision.post_install,
+            "instructions": provision.instructions,
+            "permissions": kit.manifest.permissions,
+            "setup_execution": "Instructions only. Run the appropriate setup step explicitly, then call portal_kits_reload for this kit.",
+        }))
     }
 
     /// Reconcile in-memory kit state with a freshly scanned kit list.
     /// Existing connections are shut down so the next tool call re-spawns
     /// with the updated manifest; `unsent_calls` is preserved.
-    pub async fn refresh_kits(&self, fresh: Vec<LoadedKit>) {
-        let mut kits = self.kits.lock().await;
-        let mut seen = std::collections::HashSet::new();
+    #[cfg(test)]
+    pub async fn refresh_kits(&self, fresh: KitScan, force: bool) -> bool {
+        self.refresh_kits_target(fresh, force, None).await.changed()
+    }
 
-        for kit in fresh {
+    pub async fn refresh_kits_target(
+        &self,
+        mut fresh: KitScan,
+        force: bool,
+        target: Option<&str>,
+    ) -> KitReloadReport {
+        let mut kits = self.kits.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return KitReloadReport::default();
+        }
+        // A disk scan cannot see the routes of invalid/partially written
+        // manifests, or edits excluded by a targeted reload. Keep those loaded
+        // owners in the conflict check, before changing any registry state.
+        let present_dirs: std::collections::HashSet<_> = fresh
+            .kits
+            .iter()
+            .map(|kit| kit.kit_dir.clone())
+            .chain(fresh.invalid_dirs.iter().cloned())
+            .collect();
+        let mut rejected_dirs = std::collections::HashSet::new();
+        let owners: Vec<_> = kits
+            .values()
+            .filter_map(|owner| {
+                let unchanged_by_target =
+                    target.is_some_and(|name| name != owner.kit.manifest.name);
+                if !unchanged_by_target && !present_dirs.contains(&owner.kit.kit_dir) {
+                    return None; // The old directory is uninstalled in this refresh.
+                }
+                let routes: std::collections::HashSet<_> = owner
+                    .kit
+                    .manifest
+                    .tools
+                    .iter()
+                    .map(|tool| super::loader::tool_route(&owner.kit.manifest.name, &tool.name))
+                    .collect();
+                Some((owner, unchanged_by_target, routes))
+            })
+            .collect();
+        for candidate in &fresh.kits {
+            if target.is_some_and(|name| name != candidate.manifest.name) {
+                continue;
+            }
+            let routes: std::collections::HashSet<_> = candidate
+                .manifest
+                .tools
+                .iter()
+                .map(|tool| super::loader::tool_route(&candidate.manifest.name, &tool.name))
+                .collect();
+            for (owner, unchanged_by_target, owner_routes) in &owners {
+                if candidate.kit_dir == owner.kit.kit_dir && !*unchanged_by_target {
+                    continue; // A kit may change its own routes.
+                }
+                if candidate.manifest.name == owner.kit.manifest.name
+                    || candidate.kit_dir == owner.kit.kit_dir
+                    || !routes.is_disjoint(owner_routes)
+                {
+                    warn!(
+                        "Kit '{}' conflicts with loaded kit '{}'; retaining the loaded owner",
+                        candidate.manifest.name, owner.kit.manifest.name
+                    );
+                    rejected_dirs.insert(candidate.kit_dir.clone());
+                }
+            }
+        }
+        // A rejected update also retains that directory's last usable manifest.
+        fresh
+            .kits
+            .retain(|kit| !rejected_dirs.contains(&kit.kit_dir));
+        fresh.invalid_dirs.extend(rejected_dirs);
+        let mut retired_connections = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut report = KitReloadReport::default();
+
+        for kit in fresh.kits {
             let name = kit.manifest.name.clone();
             if !seen.insert(name.clone()) {
                 warn!(
@@ -328,23 +689,39 @@ impl KitManager {
                 );
                 continue;
             }
+            if target.is_some_and(|target| target != name) {
+                continue;
+            }
 
             if let Some(state) = kits.get_mut(&name) {
                 let old_json = serde_json::to_string(&state.kit.manifest).unwrap_or_default();
                 let new_json = serde_json::to_string(&kit.manifest).unwrap_or_default();
-                if old_json != new_json {
+                if (force && target.is_none_or(|target| target == name))
+                    || old_json != new_json
+                    || state.kit.command != kit.command
+                    || state.kit.kit_dir != kit.kit_dir
+                    || state.kit.environment != kit.environment
+                    || state.kit.auth != kit.auth
+                    || (state.unhealthy
+                        && state.last_failure_at.is_none()
+                        && command_binary_exists(&kit.command))
+                {
                     let old_version = state.kit.manifest.version.clone();
                     let new_version = kit.manifest.version.clone();
-                    state.connect_gate = Arc::new(Mutex::new(()));
-                    state.kit.manifest = kit.manifest;
-                    state.kit.command = kit.command;
-                    state.kit.kit_dir = kit.kit_dir;
-                    drop_connection(state).await;
+                    state.cancelled.send_replace(true);
+                    state.cancelled = tokio::sync::watch::channel(false).0;
+                    state.start_lock = Arc::new(Mutex::new(()));
+                    state.kit = kit;
+                    if let Some(connection) = state.connection.take() {
+                        retired_connections.push(connection);
+                    }
                     state.failure_count = 0;
-                    state.unhealthy = false;
+                    state.unhealthy = !command_binary_exists(&state.kit.command);
                     state.last_failure_at = None;
+                    state.diagnostics = KitDiagnostics::new(state.unhealthy);
+                    report.reloaded.push(name.clone());
                     info!(
-                        "Kit '{}' manifest refreshed (v{} → v{})",
+                        "Kit '{}' configuration refreshed (v{} → v{})",
                         name, old_version, new_version
                     );
                 }
@@ -361,30 +738,54 @@ impl KitManager {
                 kits.insert(
                     name.clone(),
                     KitState {
-                        connect_gate: Arc::new(Mutex::new(())),
                         kit,
                         connection: None,
                         failure_count: 0,
                         unhealthy: pre_unhealthy,
                         last_failure_at: None,
                         unsent_calls: 0,
+                        diagnostics: KitDiagnostics::new(pre_unhealthy),
+                        process_slots: Arc::new(tokio::sync::Semaphore::new(
+                            crate::mcp::limits::KIT_GENERATIONS,
+                        )),
+                        start_lock: Arc::new(Mutex::new(())),
+                        cancelled: tokio::sync::watch::channel(false).0,
                     },
                 );
                 info!("Kit '{}' discovered (v{})", name, version);
+                report.added.push(name);
             }
         }
 
         let to_remove: Vec<String> = kits
             .keys()
-            .filter(|name| !seen.contains(*name))
+            .filter(|name| {
+                target.is_none_or(|target| target == name.as_str())
+                    && !seen.contains(*name)
+                    && !fresh.invalid_dirs.contains(&kits[*name].kit.kit_dir)
+            })
             .cloned()
             .collect();
         for name in to_remove {
             if let Some(mut state) = kits.remove(&name) {
-                drop_connection(&mut state).await;
+                state.cancelled.send_replace(true);
+                if let Some(connection) = state.connection.take() {
+                    retired_connections.push(connection);
+                }
                 info!("Kit '{}' removed", name);
+                report.removed.push(name);
             }
         }
+        report.retained_invalid = kits
+            .iter()
+            .filter(|(_, state)| fresh.invalid_dirs.contains(&state.kit.kit_dir))
+            .map(|(name, _)| name.clone())
+            .collect();
+        drop(kits);
+        for connection in retired_connections {
+            self.retire(connection).await;
+        }
+        report
     }
 
     /// Drain accumulated call counts per kit since the last drain, resetting
@@ -402,7 +803,42 @@ impl KitManager {
     }
 }
 
-async fn ensure_connection_with_timeout(state: &mut KitState, timeout_secs: u64) -> Result<()> {
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn next_action(state: &KitState) -> &'static str {
+    if state.kit.configuration_error().is_some() {
+        return "configure-kit";
+    }
+    if state.start_lock.try_lock().is_err() {
+        return "wait-for-startup";
+    }
+    if state.diagnostics.last_lifecycle_error.is_some() {
+        return "check-runtime-and-mcp";
+    }
+    if state
+        .diagnostics
+        .last_call
+        .as_ref()
+        .is_some_and(|call| matches!(call.outcome, "tool-error" | "request-error" | "timeout"))
+    {
+        return "inspect-tool-result";
+    }
+    "call-tool"
+}
+
+fn check_startable(state: &mut KitState) -> Result<()> {
+    // Configuration failures do not consume restart attempts. A refresh picks
+    // up corrected credentials immediately, even during the recovery cooldown.
+    if let Some(error) = state.kit.configuration_error() {
+        anyhow::bail!("Kit '{}' needs configuration: {}. Inspect portal_kits_setup for this kit (env file: {}), complete an available auth method, then call portal_kits_reload or wait for automatic refresh.",
+            state.kit.manifest.name, error, state.kit.kit_dir.join(".env").display());
+    }
     // Self-healing: an unhealthy kit gets another chance once the cooldown has
     // elapsed, so a transient fault does not require a Portal restart.
     recover_if_cooled_down(state);
@@ -415,17 +851,6 @@ async fn ensure_connection_with_timeout(state: &mut KitState, timeout_secs: u64)
         );
     }
 
-    if state
-        .connection
-        .as_ref()
-        .map(|connection| connection.is_alive())
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-
-    drop_connection(state).await;
-
     if state.failure_count >= MAX_FAILURES {
         state.unhealthy = true;
         anyhow::bail!(
@@ -436,54 +861,7 @@ async fn ensure_connection_with_timeout(state: &mut KitState, timeout_secs: u64)
         );
     }
 
-    let kit_name = state.kit.manifest.name.clone();
-    let command = state.kit.command.clone();
-    let command_text = format_command(&command);
-
-    info!("Spawning kit '{}' with command: {}", kit_name, command_text);
-
-    let config = McpServerConfig {
-        name: kit_name.clone(),
-        command,
-        env: kit_env(state),
-        cwd: Some(state.kit.kit_dir.clone()),
-    };
-
-    match timeout(
-        Duration::from_secs(timeout_secs),
-        McpConnection::spawn(config),
-    )
-    .await
-    {
-        Ok(Ok(connection)) => {
-            debug!("Kit '{}' spawned", kit_name);
-            state.connection = Some(Arc::new(connection));
-            Ok(())
-        }
-        Ok(Err(err)) => {
-            record_failure(state);
-            let message = format!(
-                "Kit '{}' failed to start: {}. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
-                kit_name, err, command_text
-            );
-            warn!("{}", message);
-            Err(anyhow::anyhow!("{}", message))
-        }
-        Err(_) => {
-            // A spawn timeout is treated like any other failure: increment the
-            // failure count and let the gradual MAX_FAILURES mechanism decide
-            // when to mark the kit unhealthy, rather than doing so immediately.
-            record_failure(state);
-            let message = format!(
-                "Kit '{}' failed to start: timed out after {} seconds. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
-                kit_name,
-                timeout_secs,
-                command_text
-            );
-            warn!("{}", message);
-            Err(anyhow::anyhow!("{}", message))
-        }
-    }
+    Ok(())
 }
 
 /// Reset an unhealthy kit back to a retryable state once the recovery cooldown
@@ -523,12 +901,6 @@ fn push_kit_tools(state: &KitState, tools: &mut Vec<ToolInfo>) {
     }
 }
 
-async fn drop_connection(state: &mut KitState) {
-    // Dropping the final connection kills its managed child and aborts readers.
-    // Never wait for process or pipe IO while holding the manager's global lock.
-    state.connection.take();
-}
-
 fn record_failure(state: &mut KitState) {
     state.failure_count = state.failure_count.saturating_add(1);
     state.last_failure_at = Some(Instant::now());
@@ -542,7 +914,7 @@ fn record_failure(state: &mut KitState) {
 }
 
 fn kit_env(state: &KitState) -> HashMap<String, String> {
-    let mut env = HashMap::new();
+    let mut env = state.kit.environment.process_values();
     env.insert(
         "PORTAL_KIT_NAME".to_string(),
         state.kit.manifest.name.clone(),
@@ -551,23 +923,15 @@ fn kit_env(state: &KitState) -> HashMap<String, String> {
         "PORTAL_KIT_DIR".to_string(),
         state.kit.kit_dir.to_string_lossy().to_string(),
     );
-    // On Unix, service managers often provide a minimal PATH, so prepend the
-    // common toolchain directories. On Windows, preserve the inherited PATH
-    // verbatim: its separator is `;` and command shims are resolved via
-    // PATHEXT (`codex` commonly maps to `codex.cmd`).
-    #[cfg(unix)]
-    let path = match std::env::var("PATH") {
-        Ok(existing) if !existing.is_empty() => format!("{}:{}", KIT_EXTRA_PATH, existing),
-        _ => KIT_EXTRA_PATH.to_string(),
-    };
-    #[cfg(not(unix))]
-    let path = std::env::var("PATH").unwrap_or_default();
-    env.insert("PATH".to_string(), path);
     env
 }
 
 fn status_text(state: &KitState) -> &'static str {
-    if state.unhealthy {
+    if state.kit.configuration_error().is_some() {
+        "needs-configuration"
+    } else if state.start_lock.try_lock().is_err() {
+        "starting"
+    } else if state.unhealthy {
         "unhealthy"
     } else if state
         .connection
@@ -774,31 +1138,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn stalled_kit_start_does_not_block_status_or_another_kit() {
-        let mut slow = loaded_kit("slow", None);
-        slow.command = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
-        let manager = KitManager::new(vec![slow, loaded_kit("healthy", None)]);
-        let task_manager = manager.clone();
-        let task = tokio::spawn(async move { task_manager.connection("slow", 30).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let statuses = timeout(Duration::from_millis(500), manager.statuses())
-            .await
-            .unwrap();
-        assert_eq!(statuses.len(), 2);
-        assert!(timeout(
-            Duration::from_millis(500),
-            manager.resolve_tool("healthy_ping")
-        )
-        .await
-        .unwrap()
-        .is_some());
-        task.abort();
-        let _ = task.await;
-        manager.shutdown().await;
-    }
-
     #[test]
     fn coerce_string_to_integer() {
         let mut args = serde_json::json!({"limit": "42"});
@@ -914,7 +1253,12 @@ mod tests {
 
     fn kit_state(kit: LoadedKit) -> KitState {
         KitState {
-            connect_gate: Arc::new(Mutex::new(())),
+            diagnostics: KitDiagnostics::new(false),
+            process_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::mcp::limits::KIT_GENERATIONS,
+            )),
+            start_lock: Arc::new(Mutex::new(())),
+            cancelled: tokio::sync::watch::channel(false).0,
             kit,
             connection: None,
             failure_count: 0,
@@ -960,9 +1304,12 @@ mod tests {
                 permissions: None,
                 workspace: None,
                 eager,
+                provision: None,
             },
             kit_dir: std::env::temp_dir(),
             command,
+            environment: Default::default(),
+            auth: Default::default(),
         }
     }
 }

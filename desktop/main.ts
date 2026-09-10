@@ -7,6 +7,8 @@ import { PortalSupervisor } from './portal';
 import { ExternalPortalObserver } from './external-portal';
 import { RuntimeUpdater, loadRuntimeBundle, type RuntimeUpdateResult } from './runtime-update';
 import { UpdateChecker } from './updates';
+import { ClientInstall } from './client-install';
+import { stageInstaller } from './manual-installer';
 import { installerEvent, handleInstallerEvent } from './installer-events';
 import { BackgroundPortal } from './background';
 import { KitInstaller } from './kit-install';
@@ -120,6 +122,8 @@ async function ready() {
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
   let recoveryBlocked = false;
+  const clientInstall = new ClientInstall(directory, background);
+  const installIntent = await clientInstall.read();
   // Only the trusted top-level local shell can control local capabilities.
   const handle = (channel: string, callback: (...args: any[]) => unknown) => {
     ipcMain.handle(channel, (event, ...args) => {
@@ -140,9 +144,34 @@ async function ready() {
       const state = await updates.check();
       const answer = await dialog.showMessageBox(window, { type: state.phase === 'available' ? 'info' : 'none', title: '客户端更新',
         message: state.phase === 'available' ? `发现 Town-Client ${state.latestVersion}` : state.message,
-        detail: `当前客户端：${app.getVersion()}${runtimeUpdate.portalVersion ? ` · Portal：${runtimeUpdate.portalVersion}` : ''}\n${runtimeUpdate.message}\n\n更新方式：保存草稿，退出客户端，安装新版后重新打开。首次启动会停止匹配的旧守护和 Portal，同步安装包中的引擎与守护程序，沿用配置并恢复原运行状态。执行中的本机任务会中断，请先结束任务。`,
-        buttons: ['关闭', '打开发布页'], defaultId: 0, cancelId: 0 });
-      if (answer.response === 1) await shell.openExternal(state.releaseUrl);
+        detail: `当前客户端：${app.getVersion()}${runtimeUpdate.portalVersion ? ` · Portal：${runtimeUpdate.portalVersion}` : ''}\n${runtimeUpdate.message}\n\n下载并校验安装包后，先停止旧 Portal 和对应守护，再安装客户端。安装完成自动打开新版，沿用原配置启动最新 Portal。请先完成本机任务并保存草稿。`,
+        buttons: state.phase === 'available' && app.isPackaged ? ['稍后', '下载并升级', '打开发布页'] : ['关闭', '打开发布页'], defaultId: 0, cancelId: 0 });
+      if (state.phase === 'available' && app.isPackaged && answer.response === 1) {
+        window?.setProgressBar(2);
+        let handoff: () => Promise<void>;
+        try { handoff = await stageInstaller(directory, state.latestVersion!, TOWN_UPDATE_REPOSITORY, process.execPath, net.fetch.bind(net) as typeof fetch); }
+        finally { window?.setProgressBar(-1); }
+        if (!window || quitting) return;
+        const confirmed = await dialog.showMessageBox(window, { type: 'info', title: '安装包已就绪', message: `安装 Town-Client ${state.latestVersion}`, detail: '已完成下载和校验。继续将停止 Portal 及守护、关闭客户端，安装成功后自动打开新版并恢复运行。执行中的本机任务会中断，请先保存草稿。', buttons: ['稍后', '停止 Portal 并安装'], defaultId: 0, cancelId: 0 });
+        if (confirmed.response !== 1) return;
+        await exclusive(async () => {
+          if (recoveryBlocked) throw new Error('请先完成上次升级恢复。');
+          const intent = await clientInstall.prepare(app.getVersion(), state.latestVersion!, store.connection, portal.managing);
+          try {
+            recoveryBlocked = true;
+            await portal.stop();
+            await handoff();
+            app.quit();
+          } catch (error) {
+            await clientInstall.resume(intent);
+            if (intent.foreground && store.connection) await portal.start(store.settings, store.connection);
+            recoveryBlocked = false;
+            throw error;
+          }
+        });
+      } else if (answer.response > 0) await shell.openExternal(state.releaseUrl);
+    } catch (error) {
+      if (window && !quitting) await dialog.showMessageBox(window, { type: 'error', title: '客户端升级未完成', message: String(error), detail: '原配置和恢复记录已保留。可重新打开客户端恢复，或稍后重试。', buttons: ['知道了'] });
     } finally { showingUpdates = false; }
   };
   handle('beings:check-updates', showUpdates);
@@ -290,9 +319,21 @@ async function ready() {
   ]));
   createWindow();
   await exclusive(async () => {
-    if (!store.connection) return;
+    if (!store.connection) { if (installIntent) await clientInstall.finish(); return; }
     try {
-      const updater = new RuntimeUpdater(directory, background);
+      if (installIntent && app.getVersion() === installIntent.from) {
+        await clientInstall.resume(installIntent);
+        if (installIntent.foreground) await portal.start(store.settings, store.connection);
+        else await publishBackground();
+        runtimeUpdate = { phase: 'error', message: '客户端安装未完成，已恢复安装前的 Portal。' };
+        return;
+      }
+      const updater = new RuntimeUpdater(directory, background, process.platform, undefined, undefined,
+        async (connection, exclude) => {
+          const saved = installIntent?.services.map(s => s.service).filter(s => s.kind === 'portable') || [];
+          const live = await externalPortal.forUpgrade(connection, background.label, exclude);
+          return [...saved, ...live.filter(s => !saved.some(old => old.root === s.root))];
+        });
       const recovered = await updater.recover();
       if (recovered) {
         runtimeUpdate = { phase: 'error', message: '已恢复上次未完成升级前的 Portal；本次启动不再自动重试升级。' };
@@ -305,7 +346,9 @@ async function ready() {
         if (runtimeUpdate.phase !== 'skipped') {
           if (runtimeUpdate.phase === 'current' || runtimeUpdate.phase === 'updated') {
             const service = background.installedService!;
+            if (installIntent && runtimeUpdate.phase === 'current') await background.load(service);
             await store.save({ ...store.settings, portalBinary: path.join(service.root, process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'), portalConfigPath: service.configPath, workspace: service.cwd || store.settings.workspace, portalEnvironmentPath: service.environment?.PATH || store.settings.portalEnvironmentPath, portalName: service.name || store.settings.portalName });
+            if (installIntent) await clientInstall.finish();
           }
           await publishBackground();
           // The completed upgrade owns and starts the replacement service.
@@ -318,12 +361,13 @@ async function ready() {
         await store.save({ ...store.settings, portalBinary: bundledBinary });
         runtimeUpdate = { phase: 'current', message: '已选择随客户端附带的 Portal，下次启动按原配置运行。', portalVersion: bundle.portalVersion };
       }
-      if (store.settings.backgroundEnabled || store.settings.autoStart) {
+      if (installIntent || store.settings.backgroundEnabled || store.settings.autoStart) {
         if (await observeExternal()) { /* Only identity-verified supervision is migrated. */ }
-        else if (store.settings.backgroundEnabled) {
+        else if (installIntent || store.settings.backgroundEnabled) {
           await background.enable(store.settings, store.connection); await publishBackground();
         } else await portal.start(store.settings, store.connection);
       }
+      if (installIntent) await clientInstall.finish();
     } catch (error) {
       recoveryBlocked = await access(path.join(directory, 'runtime-update.json')).then(() => true, () => false);
       runtimeUpdate = { phase: 'error', message: String(error) };
