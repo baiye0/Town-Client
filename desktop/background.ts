@@ -25,7 +25,7 @@ const sh = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const ps = (value: string) => `'${value.replaceAll("'", "''")}'`;
 const xml = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 16);
-export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string }
+export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; environment?: Record<string, string>; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string }
 export function fingerprint(settings: Settings, connection: Connection) {
   return hash(JSON.stringify([connection.link, settings.portalBinary, settings.portalConfigPath, settings.portalName,
     settings.workspace, settings.portalEnvironmentPath, settings.allowExec, settings.kitsEnabled, "status-v1"]));
@@ -37,21 +37,24 @@ export function launchAgent(label: string, root: string): string {
 <key>StandardOutPath</key><string>${xml(path.join(root, 'supervisor.log'))}</string><key>StandardErrorPath</key><string>${xml(path.join(root, 'supervisor.err.log'))}</string>
 </dict></plist>`;
 }
-export function unixRunner(root: string, config: string, settings: Settings): string {
-  return `#!/bin/sh\nset -eu\numask 077\ncd ${sh(settings.workspace)}\nexport PATH=${sh(settings.portalEnvironmentPath || process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}\nexport PORTAL_CONNECT_LINK="$(cat ${sh(path.join(root, 'connection.url'))})"\nexport HEART_PORTAL_SUPERVISED=1 RUST_LOG=info NO_COLOR=1\n` +
+function environmentEntries(environment: Record<string, string>) {
+  return Object.entries(environment).filter(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0'));
+}
+export function unixRunner(root: string, config: string, settings: Settings, environment: Record<string, string> = {}): string {
+  return `#!/bin/sh\nset -eu\numask 077\n${environmentEntries(environment).map(([key, value]) => `export ${key}=${sh(value)}\n`).join('')}cd ${sh(settings.workspace)}\nexport PATH=${sh(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}\nexport PORTAL_CONNECT_LINK="$(cat ${sh(path.join(root, 'connection.url'))})"\nexport HEART_PORTAL_SUPERVISED=1 RUST_LOG=info NO_COLOR=1\n` +
     `export HEART_PORTAL_STATUS_FILE=${sh(path.join(root, '.portal-connection-status.json'))}\nexport HEART_PORTAL_STATUS_NONCE="$(/usr/bin/uuidgen)"\nprintf '%s' "$HEART_PORTAL_STATUS_NONCE" >${sh(path.join(root, '.portal-status-nonce'))}\n` +
     `for log in ${sh(path.join(root, 'portal.log'))} ${sh(path.join(root, 'portal.err.log'))}; do [ ! -f "$log" ] || mv -f "$log" "$log.previous"; done\n` +
     `exec ${sh(path.join(root, 'heart-portal'))} --config ${sh(config)} --name ${sh(settings.portalName)} >${sh(path.join(root, 'portal.log'))} 2>${sh(path.join(root, 'portal.err.log'))}\n`;
 }
-export function windowsRunner(root: string, config: string, settings: Settings): string {
+export function windowsRunner(root: string, config: string, settings: Settings, environment: Record<string, string> = {}): string {
   // The scheduled task owns this process tree; it has no client/Electron dependency.
   return `$ErrorActionPreference = 'Stop'\n$root = ${ps(root)}\n` +
-`$env:PORTAL_CONNECT_LINK = [System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath (Join-Path $root 'connection.dpapi') -Raw | ConvertTo-SecureString)).Password
+`${environmentEntries(environment).map(([key, value]) => `$env:${key}=${ps(value)}\n`).join('')}$env:PORTAL_CONNECT_LINK = [System.Net.NetworkCredential]::new('', (Get-Content -LiteralPath (Join-Path $root 'connection.dpapi') -Raw | ConvertTo-SecureString)).Password
 $PID | Set-Content -LiteralPath (Join-Path $root 'supervisor.pid')
 $env:HEART_PORTAL_SUPERVISED = '1'
 $env:RUST_LOG = 'info'
 $env:NO_COLOR = '1'
-$env:PATH = ${ps(settings.portalEnvironmentPath || process.env.PATH || '')}
+$env:PATH = ${ps(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '')}
 Set-Location -LiteralPath ${ps(settings.workspace)}
 while ($true) {
   $child = $null
@@ -140,15 +143,16 @@ export class BackgroundPortal {
           if (!data.ProgramArguments?.includes(path.join(root, 'scripts/portal-launchagent.sh'))) continue;
           const link = parseConnection(await readFile(path.join(root, '.portal-connection.url'), 'utf8'));
           if (link.link !== connection.link) continue;
-          this.service = { label: data.Label, root, file, existing: true, fingerprint: fingerprint(settings, connection) };
+          this.service = { label: data.Label, root, file, existing: true, cwd: root, environment: Object.fromEntries(environmentEntries(data.EnvironmentVariables || {})), fingerprint: fingerprint(settings, connection) };
           await atomic(path.join(this.directory, 'portal-service.json'), JSON.stringify(this.service));
           break;
         } catch { /* Unrelated or unreadable services are never modified. */ }
       }
     }
-    if (!this.service && connection && settings.portalConfigPath && ['darwin', 'win32'].includes(this.platform)) {
+    if (!this.service && connection && settings.portalConfigPath && this.platform === 'darwin') {
       const root = path.dirname(settings.portalConfigPath);
       try {
+        await access(path.join(root, '.portal-supervisor.json'));
         const resolved = await realpath(settings.portalBinary);
         const expectedRoot = path.basename(path.dirname(resolved)) === 'release' && path.basename(path.dirname(path.dirname(resolved))) === 'target'
           ? path.dirname(path.dirname(path.dirname(resolved))) : path.dirname(resolved);

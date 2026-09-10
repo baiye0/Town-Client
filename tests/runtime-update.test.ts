@@ -96,3 +96,16 @@ it('recovers an interrupted switch on next startup before retrying any upgrade',
   expect(f.background.installedService).toEqual(f.previous); expect(f.background.state.running).toBe(true);
   expect(await f.updater().recover()).toBe(false);
 });
+
+it('preserves legacy launch environment and connection bytes during migration', async () => {
+  const f = await fixture();
+  const originalLink = f.connection.link + '&relay_secret=original-relay';
+  await writeFile(path.join(f.previous.root, '.portal-connection.url'), originalLink);
+  await f.background.setService({ ...f.previous, existing: true, binary: process.execPath, environment: { PATH: '/custom tools/bin:/usr/bin', LEGACY_OPTION: "spaces and ' quotes" } });
+  await f.updater().sync(f.binary, f.bundle, f.settings, f.connection);
+  const current = f.background.installedService!;
+  expect(await readFile(path.join(current.root, 'connection.url'), 'utf8')).toBe(originalLink);
+  const runner = await readFile(path.join(current.root, 'run.sh'), 'utf8');
+  expect(runner).toContain('/custom tools/bin:/usr/bin');
+  expect(current.environment).toEqual({ PATH: '/custom tools/bin:/usr/bin', LEGACY_OPTION: "spaces and ' quotes" });
+});

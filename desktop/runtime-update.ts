@@ -88,7 +88,7 @@ export class RuntimeUpdater {
     const wasEnabled = (await this.background.refresh()).enabled;
     const root = path.join(this.directory, 'portal-service', randomUUID());
     const candidate: Service = { label: previous.label, file: previous.kind === 'portable' ? path.join(root, 'launch.plist') : previous.file, root, existing: false, login: previous.login,
-      bundleId: bundle.id, configPath: config, cwd: previous.cwd || (previous.existing ? previous.root : settings.workspace),
+      environment: previous.environment, bundleId: bundle.id, configPath: config, cwd: previous.cwd || (previous.existing ? previous.root : settings.workspace),
       fingerprint: fingerprint({ ...settings, portalBinary: binary }, connection) };
     await mkdir(root, { recursive: true, mode: 0o700 });
     try {
@@ -97,10 +97,13 @@ export class RuntimeUpdater {
       if (digest(await readFile(target)) !== bundle.sha256) throw new Error('暂存 Portal 校验失败。');
       // Preserve stored credentials exactly for already-owned services.
       if (!previous.existing) await copyFile(path.join(previous.root, this.platform === 'win32' ? 'connection.dpapi' : 'connection.url'), path.join(root, this.platform === 'win32' ? 'connection.dpapi' : 'connection.url'));
-      else await this.background.protectCredential(root, connection);
+      else if (this.platform === 'darwin') {
+        await copyFile(path.join(previous.root, '.portal-connection.url'), path.join(root, 'connection.url'));
+        await chmod(path.join(root, 'connection.url'), 0o600);
+      } else await this.background.protectCredential(root, connection);
       const launchSettings = { ...settings, workspace: candidate.cwd! };
       await atomic(path.join(root, this.platform === 'win32' ? 'run.ps1' : 'run.sh'), this.platform === 'win32'
-        ? '\ufeff' + windowsRunner(root, config, launchSettings) : unixRunner(root, config, launchSettings));
+        ? '\ufeff' + windowsRunner(root, config, launchSettings, previous.environment) : unixRunner(root, config, launchSettings, previous.environment));
       await atomic(path.join(root, 'runtime-bundle.json'), JSON.stringify(bundle));
       const transaction: Journal = { schema: 1, previous, candidate, enabled: wasEnabled,
         ...(this.platform === 'darwin' && previous.kind !== 'portable' ? { previousPlist: await readFile(previous.file, 'utf8') } : {}) };

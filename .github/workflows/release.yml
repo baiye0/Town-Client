@@ -32,6 +32,11 @@ jobs:
         run: node -e "const p=require('./package.json'); if(process.env.GITHUB_REF_NAME !== 'v'+p.version) process.exit(1)"
       - run: cargo test --manifest-path heart-portal/Cargo.toml --locked -- --test-threads=1
       - run: npm run build:portal
+      - name: Verify native Windows service upgrade and rollback
+        if: runner.os == 'Windows'
+        env:
+          TOWN_NATIVE_UPGRADE_TESTS: '1'
+        run: npx vitest run tests/runtime-update-native.test.ts
       - run: npm run make
       - uses: actions/upload-artifact@v4
         with:
