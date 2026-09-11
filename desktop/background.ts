@@ -36,12 +36,12 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 export interface Service { label: string; file: string; root: string; existing: boolean; kind?: 'portable'; login?: boolean; name?: string; environmentPath?: string; environment?: Record<string, string>; fingerprint?: string; bundleId?: string; configPath?: string; cwd?: string; binary?: string; legacyProcessHealth?: boolean }
 export function fingerprint(settings: Settings, connection: Connection) {
   return hash(JSON.stringify([connection.link, settings.portalBinary, settings.portalConfigPath, settings.portalName,
-    settings.workspace, settings.portalEnvironmentPath, settings.allowExec, settings.kitsEnabled, "status-v1"]));
+    settings.workspace, settings.portalEnvironmentPath, settings.allowExec, settings.kitsEnabled, 'bounded-recovery-v1']));
 }
 export function launchAgent(label: string, root: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>
 <key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>${xml(path.join(root, 'run.sh'))}</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>5</integer><key>ExitTimeOut</key><integer>15</integer><key>AbandonProcessGroup</key><false/><key>Umask</key><integer>63</integer>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>PathState</key><dict><key>${xml(path.join(root, '.portal-start-failure'))}</key><false/></dict></dict><key>ThrottleInterval</key><integer>5</integer><key>ExitTimeOut</key><integer>15</integer><key>AbandonProcessGroup</key><false/><key>Umask</key><integer>63</integer>
 <key>StandardOutPath</key><string>${xml(path.join(root, 'supervisor.log'))}</string><key>StandardErrorPath</key><string>${xml(path.join(root, 'supervisor.err.log'))}</string>
 </dict></plist>`;
 }
@@ -49,7 +49,24 @@ function environmentEntries(environment: Record<string, string>) {
   return Object.entries(environment).filter(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0'));
 }
 export function unixRunner(root: string, config: string, settings: Settings, environment: Record<string, string> = {}): string {
-  return `#!/bin/sh\nset -eu\numask 077\n${environmentEntries(environment).map(([key, value]) => `export ${key}=${sh(value)}\n`).join('')}cd ${sh(settings.workspace)}\nexport PATH=${sh(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}\nexport PORTAL_CONNECT_LINK="$(cat ${sh(path.join(root, 'connection.url'))})"\nexport HEART_PORTAL_SUPERVISED=1 HEART_PORTAL_CLIENT_MANAGED=1 RUST_LOG=info NO_COLOR=1\n` +
+  // Keep exec so launchd's PID remains the engine PID. Persist the attempt count
+  // across launchd retries. The failure marker stops KeepAlive recovery while
+  // normal exits (including the native portal_restart tool) still restart.
+  return `#!/bin/sh\nset -eu\numask 077
+failure=${sh(path.join(root, '.portal-start-failure'))}
+attempt=${sh(path.join(root, '.portal-start-attempt'))}
+if [ -s "$failure" ]; then exit 0; fi
+previous=0; crashes=0
+if [ -f "$attempt" ]; then read -r previous crashes < "$attempt" || true; fi
+case "$previous:$crashes" in *[!0-9:]*) previous=0; crashes=0;; esac
+now=$(/bin/date +%s)
+if [ "$previous" -gt 0 ] && /usr/bin/grep -Eq 'another (legacy )?Portal instance is already running' ${sh(path.join(root, 'portal.err.log'))} 2>/dev/null; then
+  printf '%s' conflict > "$failure"; exit 0
+fi
+if [ "$((now - previous))" -ge 60 ]; then crashes=0; fi
+if [ "$crashes" -ge 6 ]; then printf '%s' crash-limit > "$failure"; exit 0; fi
+printf '%s %s\\n' "$now" "$((crashes + 1))" > "$attempt"
+${environmentEntries(environment).map(([key, value]) => `export ${key}=${sh(value)}\n`).join('')}cd ${sh(settings.workspace)}\nexport PATH=${sh(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin')}\nexport PORTAL_CONNECT_LINK="$(cat ${sh(path.join(root, 'connection.url'))})"\nexport HEART_PORTAL_SUPERVISED=1 HEART_PORTAL_CLIENT_MANAGED=1 RUST_LOG=info NO_COLOR=1\n` +
     `export HEART_PORTAL_STATUS_FILE=${sh(path.join(root, '.portal-connection-status.json'))}\nexport HEART_PORTAL_STATUS_NONCE="$(/usr/bin/uuidgen)"\nprintf '%s' "$HEART_PORTAL_STATUS_NONCE" >${sh(path.join(root, '.portal-status-nonce'))}\n` +
     `printf '%s' "$HEART_PORTAL_STATUS_NONCE" >${sh(path.join(root, '.portal-launch-nonce'))}\n` +
     `export HEART_PORTAL_READY_FILE=${sh(path.join(root, '.portal-ready.json'))}\nexport HEART_PORTAL_READY_NONCE="$HEART_PORTAL_STATUS_NONCE"\n` +
@@ -67,8 +84,13 @@ $env:RUST_LOG = 'info'
 $env:NO_COLOR = '1'
 $env:PATH = ${ps(settings.portalEnvironmentPath || environment.PATH || process.env.PATH || '')}
 Set-Location -LiteralPath ${ps(settings.workspace)}
+$crashes = 0
+$failure = Join-Path $root '.portal-start-failure'
+if (Test-Path -LiteralPath $failure) { exit 0 }
 while ($true) {
   $child = $null
+  $out = $null; $err = $null
+  $started = [DateTime]::UtcNow
   try {
     $env:HEART_PORTAL_STATUS_FILE = Join-Path $root '.portal-connection-status.json'
     $env:HEART_PORTAL_STATUS_NONCE = [Guid]::NewGuid().ToString()
@@ -97,8 +119,15 @@ while ($true) {
     if ($child) { if (-not $child.HasExited) { $child.Kill() }; $child.Dispose() }
     if ($out) { $out.Dispose() }; if ($err) { $err.Dispose() }
   }
+  if (([DateTime]::UtcNow - $started).TotalSeconds -ge 60) { $crashes = 0 }
+  $crashes++
+  if (Select-String -LiteralPath (Join-Path $root 'portal.err.log') -Pattern 'another (legacy )?Portal instance is already running' -Quiet -ErrorAction SilentlyContinue) {
+    [IO.File]::WriteAllText($failure, 'conflict'); break
+  }
+  if ($crashes -ge 6) { [IO.File]::WriteAllText($failure, 'crash-limit'); break }
   Start-Sleep -Seconds 5
 }
+exit 0
 `;
 }
 export function windowsArgument(value: string) { return '"' + value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1') + '"'; }
@@ -129,7 +158,7 @@ export class BackgroundPortal {
   readonly label: string;
   get runtimeDirectory() { return path.join(this.directory, 'portal-service'); }
   constructor(private directory: string, private run: Command = command, private platform = process.platform, private home = os.homedir()) {
-    this.label = `town.beings.desktop.portal.${hash(path.resolve(directory))}`;
+    this.label = `town.beings.portal-desktop.portal.${hash(path.resolve(directory))}`;
     this.state = { supported: ['darwin', 'win32'].includes(platform), installed: false, enabled: false, running: false, existing: false,
       message: ['darwin', 'win32'].includes(platform) ? '未启用后台服务' : '此版本的后台服务支持 macOS 和 Windows' };
   }
@@ -215,7 +244,7 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
       if (running) pid = Number(status.pid) || undefined;
     }
     this.state = { supported: this.state.supported, installed: true, enabled, running, existing: service.existing, label: service.label, pid,
-      message: !loaded ? '已登记的旧后台服务当前未加载；独立 Portal 状态另行识别' : enabled ? `登录后自动启动 · 退出客户端后继续运行 · 异常退出自动重启${service.existing ? '（沿用已有服务）' : ''}` : '后台服务已停用，不会随登录启动' };
+      message: !loaded ? '后台服务当前未加载，可点击启动 Portal 重试' : enabled ? `登录后自动启动 · 退出客户端后继续运行 · 连续异常退出最多重试 5 次${service.existing ? '（沿用已有服务）' : ''}` : '后台服务已停用，不会随登录启动' };
     return this.state;
   }
   async portalState(): Promise<PortalState> {
@@ -233,6 +262,14 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
       ? await readPortalSample(path.join(root, '.portal-connection-status.json'), this.state.pid, nonce) : null;
     const ready = !sample && this.state.running && this.state.pid && await readPortalReady(path.join(root, '.portal-ready.json'), this.state.pid, nonce);
     const state = portalSampleState(sample, Boolean(ready));
+    if (this.state.enabled && !this.state.running) {
+      const failure = (await tail(path.join(root, '.portal-start-failure'))).trim();
+      const conflict = failure === 'conflict' || /another (legacy )?Portal instance is already running/.test(errors);
+      return { phase: failure || conflict ? 'error' : 'reconnecting', conflict, managed: !this.service.existing, logs,
+        message: conflict ? '同一个 Being 已有本机 Portal 在运行，已停止重复启动。请先停止原服务，再点击启动 Portal。'
+          : failure ? 'Portal 连续启动失败，已停止自动重试。请检查运行日志，修正后点击启动 Portal。'
+          : '后台 Portal 已退出，正在等待恢复；连续失败最多重试 5 次。' };
+    }
     return { ...state, phase: !this.state.enabled || !this.state.running ? 'stopped' : state.phase,
       pid: this.state.pid, message: !this.state.enabled ? this.state.message : this.state.running ? state.message : '后台 Portal 当前未运行；尚未确认自动恢复', logs };
   }
@@ -252,7 +289,7 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
     let registrationChanged = false;
     let wasEnabled = false;
     let oldPlist: string | undefined;
-    const service: Service = { label: this.label, root, existing: false, fingerprint: signature,
+    const service: Service = { label: this.label, root, existing: false, name: settings.portalName, fingerprint: signature,
       file: this.platform === 'darwin' ? path.join(this.home, 'Library/LaunchAgents', this.label + '.plist') : '' };
     try {
       const binary = path.join(root, this.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
@@ -302,7 +339,7 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
 $a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${ps(args)};
 ${service.login === false ? '' : '$t=New-ScheduledTaskTrigger -AtLogOn -User $user;'}
 $p=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited;
-$s=New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable;
+$s=New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable;
 Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login === false ? '' : '-Trigger $t'} -Principal $p -Settings $s -Force | Out-Null`);
   }
   async load(service: Service) {
@@ -322,7 +359,9 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login
     }
     if (this.platform === 'darwin') {
       await this.run('/bin/launchctl', ['enable', `${this.domain}/${service.label}`]);
-      const loaded = await this.run('/bin/launchctl', ['print', `${this.domain}/${service.label}`]).then(() => true, () => false);
+      const status = await this.run('/bin/launchctl', ['print', `${this.domain}/${service.label}`]).catch(() => '');
+      const loaded = Boolean(status);
+      if (!service.existing && !/state = running/.test(status)) await this.resetRecovery(service);
       if (!loaded) {
         // bootout can return while launchd is still releasing the old job.
         for (let attempt = 0; ; attempt++) {
@@ -332,8 +371,20 @@ Register-ScheduledTask -TaskName ${ps(service.label)} -Action $a ${service.login
             await new Promise(resolve => setTimeout(resolve, 500));
           }
         }
+      } else if (!/state = running/.test(status)) {
+        // A loaded launchd job may have stopped after a terminal startup error.
+        await this.run('/bin/launchctl', ['kickstart', `${this.domain}/${service.label}`]);
       }
-    } else await this.powershell(`Enable-ScheduledTask -TaskName ${ps(service.label)} | Out-Null; Start-ScheduledTask -TaskName ${ps(service.label)}`);
+    } else {
+      const status = await this.powershell(`[string](Get-ScheduledTask -TaskName ${ps(service.label)}).State`);
+      if (status.trim() !== 'Running' && !service.existing) await this.resetRecovery(service);
+      await this.powershell(`Enable-ScheduledTask -TaskName ${ps(service.label)} | Out-Null; Start-ScheduledTask -TaskName ${ps(service.label)}`);
+    }
+  }
+  private async resetRecovery(service: Service) {
+    await rm(path.join(service.root, '.portal-start-attempt'), { force: true });
+    // Removing this marker may wake launchd immediately, so clear the budget first.
+    await rm(path.join(service.root, '.portal-start-failure'), { force: true });
   }
   async unload(service: Service) {
     if (service.kind === 'portable') {
@@ -386,6 +437,12 @@ while (($task=Get-ScheduledTask -TaskName ${ps(service.label)} -ErrorAction Sile
 }`);
   }
   get installedService(): Service | null { return this.service; }
+  async forget() {
+    // Release an already-stopped adopted service; retain its files and registration.
+    await rm(path.join(this.directory, 'portal-service.json'), { force: true });
+    this.service = null;
+    this.state = { supported: this.state.supported, installed: false, enabled: false, running: false, existing: false, message: '等待启动客户端 Portal' };
+  }
   async setService(service: Service) {
     await atomic(path.join(this.directory, 'portal-service.json'), JSON.stringify(service));
     this.service = service;
@@ -405,8 +462,7 @@ while (($task=Get-ScheduledTask -TaskName ${ps(service.label)} -ErrorAction Sile
   async disable() { if (this.service) await this.unload(this.service); return this.refresh(); }
   async restart() {
     if (!this.service || !this.state.enabled) throw new Error('后台 Portal 尚未启用。');
-    if (this.platform === 'darwin') await this.run('/bin/launchctl', ['kickstart', '-k', `${this.domain}/${this.service.label}`]);
-    else { await this.unload(this.service); await this.load(this.service); }
+    await this.unload(this.service); await this.load(this.service);
     return this.refresh();
   }
 }

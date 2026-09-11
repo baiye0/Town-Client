@@ -2,6 +2,17 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { DesktopAPI, PortalState, TownLiveState } from './shared';
 const api: DesktopAPI = {
   platform: process.platform,
+  clientStartup: enabled => ipcRenderer.invoke('beings:client-startup', enabled),
+  quit: () => ipcRenderer.invoke('beings:quit'),
+  browserState: () => ipcRenderer.invoke('beings:browser-state'),
+  openBrowser: url => ipcRenderer.invoke('beings:browser-open', url),
+  browserAction: action => ipcRenderer.invoke('beings:browser-action', action),
+  browserBounds: bounds => ipcRenderer.invoke('beings:browser-bounds', bounds),
+  onBrowser: callback => {
+    const listener = (_event: unknown, state: import('./shared').BrowserState) => callback(state);
+    ipcRenderer.on('beings:browser-state', listener);
+    return () => ipcRenderer.removeListener('beings:browser-state', listener);
+  },
   checkUpdates: () => ipcRenderer.invoke('beings:check-updates'),
   updateState: () => ipcRenderer.invoke('beings:update-state'),
   onUpdate: callback => {
@@ -34,8 +45,12 @@ const api: DesktopAPI = {
   save: input => ipcRenderer.invoke('beings:save', input),
   choose: kind => ipcRenderer.invoke('beings:choose', kind),
   startPortal: () => ipcRenderer.invoke('beings:portal-start'),
+  connectionDefaults: input => ipcRenderer.invoke('beings:connection-defaults', input),
   stopPortal: () => ipcRenderer.invoke('beings:portal-stop'),
   openWorkspace: () => ipcRenderer.invoke('beings:workspace'),
+  diagnostics: () => ipcRenderer.invoke('beings:diagnostics'),
+  exportDiagnostics: () => ipcRenderer.invoke('beings:diagnostics-export'),
+  openLoom: () => ipcRenderer.invoke('beings:open-loom'),
   onPortal: callback => {
     const listener = (_event: unknown, state: PortalState) => callback(state);
     ipcRenderer.on('beings:portal-state', listener);

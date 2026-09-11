@@ -1,4 +1,4 @@
-# Beings 桌面架构
+# portal-desktop 桌面架构
 
 参考 Codex 的「桌面 UI / 本地引擎分离」模式。OpenAI 的公开
 [App Server 文档](https://learn.chatgpt.com/docs/app-server)描述了富客户端使用独立引擎、
@@ -40,7 +40,9 @@ Portal 的 connect 模式不会打开旧的 Cowork HTTP 服务或 MCP TCP 端口
 后台模式中 macOS launchd 或 Windows PowerShell 守护脚本约 5 秒后重新启动它。Windows 计划任务同时负责守护脚本自身的异常恢复。临时模式仍由 Electron 负责。网络重连由 Rust 内置退避负责。
 日志匹配用于展示 Relay 状态，不把进程存在当成已完成握手。
 
-`background.ts` 将引擎复制到应用数据目录内的独立版本目录，注册当前用户的登录任务。服务只运行 Rust 和系统启动脚本，不启动 Electron 或窗口。设置更新先准备新运行目录，注册失败时恢复旧服务；只在成功后替换服务元数据。相同配置重复启动只附着，不重启正在工作的进程。设置中的后台开关控制持久启动，显式停止同时禁用登录恢复，退出窗口只停止临时子进程。
+`background.ts` 将引擎复制到应用数据目录内的独立版本目录，注册当前用户的登录任务。服务只运行 Rust 和系统启动脚本，不启动 Electron 或窗口。设置更新先准备新运行目录，注册失败时恢复旧服务；只在成功后替换服务元数据。相同配置重复启动只附着，不重启正在工作的进程。设置中的后台开关控制持久启动，显式停止同时禁用登录恢复。关闭窗口仅隐藏并保留临时 Portal；明确退出客户端才会清理临时子进程。
+
+客户端托盘提供恢复窗口和退出入口；Dock 激活与第二次启动同样恢复原窗口。`client-startup.ts` 独立管理 macOS/Windows 的客户端登录自启，读取系统状态并校验写入结果，不依赖 Being 配置或 Portal 生命周期。Windows Squirrel 安装使用稳定的上级启动器，便携版使用当前可执行文件；开发模式与 Linux 不注册登录项。
 
 macOS 可识别配置目录、连接链接和已知启动脚本均匹配的原 Heart Portal LaunchAgent；不改写它的脚本、TOML 或凭据。改变此类已有服务的连接/路径需要在原配置中处理。新建的 macOS 后台凭据用 `0600` 文件和 `0700` 目录保护；Windows 后台凭据用当前用户 DPAPI 加密。服务注册项和进程参数不包含 token。
 
@@ -51,7 +53,7 @@ macOS 可识别配置目录、连接链接和已知启动脚本均匹配的原 H
 - 主进程代理只允许已有的 10 个聊天/配置路由及对应方法，不接受任意 URL、Cookie 或认证头。
 - 上游请求禁止重定向，凭据不会被带到不同站点。SSE 逐块返回，取消和连接切换会终止上游请求。
 - 页面资源离线打包。聊天保留旧 UI 所需的内联处理器，但独立 CSP 禁止任意外部脚本、iframe 和表单。
-- 新窗口/导航只允许经过协议筛选的 HTTP(S) 链接在系统浏览器打开。
+- 新窗口/导航只允许经过协议筛选的 HTTP(S) 链接在内置浏览器打开。
 - `safeStorage` 加密客户端凭据；后台凭据另按上述 OS 机制保存。UI 展示最近 300 行脱敏日志；后台文件日志由系统启动脚本写入，macOS 每次重启保留上一份。
 - 工作目录约束由 Rust 文件工具执行。用户开启命令和扩展工具后，这些能力具有对应进程权限，不能声称文件工具的目录边界约束了所有 shell 行为。
 
@@ -59,14 +61,15 @@ macOS 可识别配置目录、连接链接和已知启动脚本均匹配的原 H
 
 对话内容左缘提供刻度式快速索引：悬停或键盘聚焦预览该轮提问和回复，点击跳转，滚动时高亮当前位置，并可回到最新消息。索引直接从聊天 frame 的已加载消息生成，不保存对话副本。左侧搜索接收限定长度的提问摘要，校验 frame source/origin 和当前 revision 后以纯文本渲染，展开/收起采用淡入与高度过渡，遵循系统减少动态效果设置。重载后从云端历史重建，范围与现有 `/api/history?limit=100` 一致。跳转复用聊天滚动控制器，保留草稿并暂停流式输出的自动跟随。
 
-已覆盖内置对话、本机 Portal、小镇内容客户端、Kit 清单/导入以及桌面打包。篝火/邮局/卷轴的真实数据仍取决于 Town 服务的认证授权。未来可在服务端协议支持后扩展多 Being、
-多会话；系统托盘、逐次工具审批、签名公证及应用自动下载/替换尚未实现；检查更新和手动安装后的 Portal 配套升级见 UPDATING.md。后台登录自启已支持 macOS 和 Windows，Windows 需在目标系统进一步验证；Linux 暂仅支持临时运行。登录前启动及休眠时联网不在本功能范围内。
+已覆盖内置对话、本机 Portal、小镇内容客户端、Kit 清单/导入以及桌面打包。篝火/邮局/卷轴的真实数据仍取决于 Town 服务的认证授权。当前不扩展多会话或自建服务端能力；逐次工具审批、签名公证尚未实现；检查更新和手动安装后的 Portal 配套升级见 UPDATING.md。后台登录自启已支持 macOS 和 Windows，Windows 需在目标系统进一步验证；Linux 暂仅支持临时运行。登录前启动及休眠时联网不在本功能范围内。
 
 Electron 的 API 和隔离配置参考
 [protocol](https://www.electronjs.org/docs/latest/api/protocol) 与
 [Security](https://www.electronjs.org/docs/latest/tutorial/security) 官方文档。
 
 ## Town 与 Kits
+
+社区插件的后续扩展契约见 [插件扩展方案](EXTENSIONS.md)。该文档区分现有 Kit 能力与拟议的界面插件宿主；下文描述当前已实现的运行路径。
 
 `TownClient` 使用独立 GET 路由表与固定 `https://beings.town` 源。IPC 不接受任意请求地址、
 方法或认证头。配对通过固定 `POST /api/client/pair/confirm` 交换 `{being_id, code}`，主进程校验输入、响应身份和 token，再加密保存。token 不返回渲染器，配对码不落盘。公开目录/Grove/Embers 不带凭据；篝火、围炉、邮件及卷轴使用独立 Town 凭据，按 SDK 使用 Authorization Bearer，仅发给固定 Town 源。
@@ -108,4 +111,12 @@ Portal 自身按 60 秒周期刷新 Kit；用户还可以从客户端重启识�
 
 `external-portal.ts` 在客户端没有管理临时子进程、已登记后台服务没有运行时，只读识别同用户的 `heart-portal`。核对可执行文件、运行目录中的 readiness PID/启动 nonce、当前 Being 连接身份，并仅解析本次进程启动后的 Relay 日志。握手记录和现存 TCP 连接共同支持“已连接”；这不是工具调用或 Heart 场景回执的证明。日志读取限制为末尾 2 MB，缺少证据时显示连接未确认。
 
-独立进程标注 `managed: false`，保留其原有守护方式，客户端不自动启动重复实例、不停止它、不通过旧服务重启应用 Kits。当前独立运行时识别限 macOS；Windows 继续通过客户端计划任务识别。未加载的旧 LaunchAgent 不再冒充正在恢复/重连的服务。
+独立进程标注 `managed: false`，可通过「使用客户端 Portal」发起接管。`external-portal.ts` 同时检查本用户的旧客户端登录任务和独立守护，按 Relay 主机与 Being 识别冲突，支持 token 轮换；确认前不授予启停所有权。macOS 检查 LaunchAgent 实际加载路径，Windows 检查计划任务所有者、执行文件及 DPAPI 连接。没有确认管理方式的运行时不会仅按进程名终止。
+
+`portal-takeover.ts` 在二进制和连接预检之后请求确认，再重新核对服务登记，依次停用守护、等待引擎退出、检查残留，最后启动客户端引擎。取消、停止失败、启动失败和中断记录保存在 profile 内；自动入口不重复弹窗或重启，手动入口才允许重试。接管失败不自动恢复旧守护，旧配置和工作目录保留。macOS 用失败标记控制 launchd KeepAlive，保留正常 `portal_restart`；其他连续失败最多重试 5 次。
+
+连接表单使用完整 Loom 地址确定 Being，不单独提供名称字段或改写连接目标。Portal 名称可编辑，旧名称作为默认值，不覆盖用户已输入的名称。保存先验证 Being，再由统一的启动与接管流程运行 Portal，避免渲染器重复触发启动。
+
+内置浏览器使用 Electron WebContentsView，布局由 shell 上报，主进程限制在窗口内容区域。独立 persist:beings-browser 会话无 preload、Node 或客户端 IPC，拒绝网页权限申请，仅允许 HTTP(S) 导航。地址栏隐藏凭据参数和 fragment，完整链接仅保留在主进程及目标网页中。打开 HTML dialog 时隐藏原生视图，避免遮挡设置。关闭面板销毁 webContents；退出客户端一并清理。
+
+连接诊断复用 verifyBeingConnection 的只读 `/api/status` 检查以及已持有的 Portal、Town 状态；显示当前构建标识和进程。导出仅含状态，不导出引擎日志或聊天内容。退出清理失败时恢复窗口并提示错误，避免未处理拒绝和盲目退出；不会重启客户端。

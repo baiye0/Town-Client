@@ -48,6 +48,9 @@ import { mountChatLinks } from './chat-links';
   window.addEventListener('message', event => {
     if (event.source !== parent) return;
     const data = event.data;
+    if (data?.type === 'beings:reading' && Number.isInteger(data.size) && data.size >= 13 && data.size <= 21) {
+      document.documentElement.style.setProperty('--reading-size', data.size + 'px'); return;
+    }
     if (data?.type === 'beings:town-activity' && Array.isArray(data.channels)) { updatePlaces?.(data.channels.filter((v: unknown) => ['bonfire', 'mail', 'firesides'].includes(String(v)))); return; }
     if (data?.type === 'beings:chat-action') {
       const ui = window as unknown as { toggleSettings: () => void; toggleSoulCard: () => void; togglePrivacy: () => void };

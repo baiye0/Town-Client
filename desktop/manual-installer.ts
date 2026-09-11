@@ -10,8 +10,8 @@ const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 const ps = (s: string) => `'${s.replaceAll("'", "''")}'`;
 export function assetName(version: string, platform = process.platform, arch = process.arch) {
   if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('无效的更新版本。');
-  if (platform === 'darwin' && arch === 'arm64') return `Town-Client-${version}-macos-arm64.zip`;
-  if (platform === 'win32' && arch === 'x64') return `Town-Client-${version}-windows-x64-Setup.exe`;
+  if (platform === 'darwin' && arch === 'arm64') return `portal-desktop-${version}-macos-arm64.zip`;
+  if (platform === 'win32' && arch === 'x64') return `portal-desktop-${version}-windows-x64-Setup.exe`;
   throw new Error('当前平台没有配套安装包，请查看发布页。');
 }
 async function download(url: string, file: string, max: number, fetcher: typeof fetch) {
@@ -61,9 +61,9 @@ try {
   # Wait for Setup itself, not any newly launched long-lived client descendants.
   $result.WaitForExit()
   if ($result.ExitCode -ne 0) { throw 'Client installation failed' }
-  $updater=Join-Path $env:LOCALAPPDATA 'beings/Update.exe'
+  $updater=Join-Path $env:LOCALAPPDATA 'portal-desktop/Update.exe'
   if (!(Test-Path -LiteralPath $updater)) { throw 'Installed client missing' }
-  Start-Process -FilePath $updater -ArgumentList '--processStart','beings.exe'
+  Start-Process -FilePath $updater -ArgumentList '--processStart','portal-desktop.exe'
 } catch {
   Start-Process -FilePath ${ps(oldExecutable)}
   throw
@@ -86,7 +86,7 @@ export async function stageInstaller(directory: string, version: string, reposit
     const current = path.resolve(executable, '../../..');
     if (!current.endsWith('.app')) throw new Error('无法识别当前 macOS 应用目录。');
     await access(path.dirname(current), constants.W_OK);
-    const stage = path.join(path.dirname(current), `.Town-Client-update-${randomUUID()}`);
+    const stage = path.join(path.dirname(current), `.portal-desktop-update-${randomUUID()}`);
     await mkdir(stage, { mode: 0o700 });
     await command('/usr/bin/ditto', ['-xk', installer, stage]);
     const apps = (await readdir(stage)).filter(name => name.endsWith('.app'));
@@ -94,7 +94,7 @@ export async function stageInstaller(directory: string, version: string, reposit
     const candidate = path.join(stage, apps[0]);
     const plist = JSON.parse(await command('/usr/bin/plutil', ['-convert', 'json', '-o', '-', path.join(candidate, 'Contents/Info.plist')]));
     const { bundle } = await loadRuntimeBundle(path.join(candidate, 'Contents/Resources'));
-    if (plist.CFBundleIdentifier !== 'town.beings.desktop' || plist.CFBundleShortVersionString !== version || bundle.clientVersion !== version) throw new Error('安装包版本或应用标识不匹配。');
+    if (plist.CFBundleIdentifier !== 'town.beings.portal-desktop' || plist.CFBundleShortVersionString !== version || bundle.clientVersion !== version) throw new Error('安装包版本或应用标识不匹配。');
     script = macInstallerScript(process.pid, current, candidate, path.join(stage, 'Previous.app'));
     scriptFile = path.join(root, 'install.sh');
   } else {

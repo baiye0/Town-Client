@@ -1,11 +1,11 @@
 import { sceneExcerpt, type SceneStore, type SceneResource } from './scene-store';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
-import { newFeedFilters, renderTownFeed, type FeedFilters } from './town-feed';
+import { newFeedFilters, renderTownFeed, type FeedFilters, type FeedReply } from './town-feed';
 import type { DesktopAPI, KitLibrary, LocalKit, TownChannel, TownLiveState, TownPost, TownKind, TownQuery } from '../shared';
 
 type Data = Record<string, unknown>;
-type SendTarget = { kind: TownPost['kind']; firesideId?: string; generation: number; beingId: string };
+type SendTarget = { kind: TownPost['kind']; firesideId?: string; generation: number; beingId: string; reply?: FeedReply };
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const record = (value: unknown): Data => value && typeof value === 'object' && !Array.isArray(value) ? value as Data : {};
 const str = (value: unknown, fallback = '') => typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
@@ -72,6 +72,7 @@ export class TownViews {
   private reconciling = false;
   private sendBusy = false;
   private sendTarget?: SendTarget;
+  private drafts = new Map<string, { content: string; recipient: string }>();
 
   constructor(private api: DesktopAPI, private toast: (error: unknown) => void, private navigate: (view: string) => void, private scenes: SceneStore, private showCompanion: () => void) {
     api.onTownLive(state => this.receiveLive(state));
@@ -83,6 +84,9 @@ export class TownViews {
     $('town-send-close').addEventListener('click', () => { if (!this.sendBusy) $<HTMLDialogElement>('town-send-dialog').close(); });
     $('town-send-dialog').addEventListener('cancel', event => { if (this.sendBusy) event.preventDefault(); });
     $('town-send-form').addEventListener('submit', event => { event.preventDefault(); void this.send(); });
+    $('town-send-content').addEventListener('input', () => this.updateComposer());
+    $('town-send-content').addEventListener('keydown', event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !event.isComposing) { event.preventDefault(); if (!$<HTMLButtonElement>('town-send-submit').disabled) $<HTMLFormElement>('town-send-form').requestSubmit(); } });
+    $('town-reply-clear').addEventListener('click', () => { if (this.sendTarget && !this.sendBusy) { this.sendTarget.reply = undefined; $('town-send-reply').hidden = true; $<HTMLInputElement>('town-recipient').readOnly = false; } });
     $('scroll-kind').addEventListener('change', () => { this.offset = 0; void this.load(); });
     $('town-refresh').addEventListener('click', () => void this.load());
     $('town-search').addEventListener('input', () => this.render());
@@ -108,9 +112,10 @@ export class TownViews {
     $('town-write').hidden = !channel;
     $<HTMLButtonElement>('town-write').disabled = live?.phase !== 'connected' || this.view === 'firesides' && !(this.directId || this.selectedRing);
     $('town-write').textContent = this.view === 'mail' ? '写私信' : '写一句';
-    $<HTMLButtonElement>('town-send-submit').disabled = this.sendBusy || live?.phase !== 'connected';
+    this.updateComposer();
     const channels = (['bonfire', 'mail', 'firesides'] as TownChannel[]).filter(unread);
-    $<HTMLIFrameElement>('chat-frame').contentWindow?.postMessage({ type: 'beings:town-activity', channels }, 'beings://chat');
+    const frame = $<HTMLIFrameElement>('chat-frame');
+    if (frame.getAttribute('src')) frame.contentWindow?.postMessage({ type: 'beings:town-activity', channels }, 'beings://chat');
   }
   private receiveLive(state: TownLiveState) {
     if (this.live && state.revision <= this.live.revision) return;
@@ -123,7 +128,7 @@ export class TownViews {
       this.seen = { bonfire: 0, mail: 0, firesides: 0 }; this.changed.clear();
       this.request++; this.detailRequest++; this.data = null; this.ringData = null; this.me = ''; this.selectedRing = ''; this.feedFilters = {};
       this.scenes.resetIdentity();
-      this.sendTarget = undefined; $<HTMLTextAreaElement>('town-send-content').value = ''; $<HTMLInputElement>('town-recipient').value = '';
+      this.drafts.clear(); this.sendTarget = undefined; $<HTMLTextAreaElement>('town-send-content').value = ''; $<HTMLInputElement>('town-recipient').value = '';
       $<HTMLDialogElement>('town-send-dialog').close();
       $('town-body').replaceChildren();
       if (definitions[this.view]) {
@@ -166,23 +171,37 @@ export class TownViews {
     if (!channel || !start || start.generation !== this.live?.generation) return;
     this.seen[channel] = start.versions[channel]; this.changed.delete(channel); this.updateLive();
   }
-  private compose() {
+  private updateComposer() {
+    const count = [...$<HTMLTextAreaElement>('town-send-content').value].length;
+    const limit = this.sendTarget?.kind === 'bonfire' ? 4000 : 32000;
+    $('town-send-count').textContent = `${count.toLocaleString()} / ${limit.toLocaleString()} 字`;
+    $('town-send-count').classList.toggle('over-limit', count > limit);
+    $<HTMLButtonElement>('town-send-submit').disabled = this.sendBusy || this.live?.phase !== 'connected' || !$<HTMLTextAreaElement>('town-send-content').value.trim() || count > limit;
+  }
+  private compose(reply?: FeedReply) {
     const live = this.live;
     if (live?.phase !== 'connected' || !live.beingId || !this.channel()) return;
     const kind = this.view === 'mail' ? 'dm' : this.view === 'firesides' ? 'fireside' : 'bonfire';
     const firesideId = this.directId || this.selectedRing;
     if (kind === 'fireside' && !firesideId) return;
-    const next = { kind, firesideId: kind === 'fireside' ? firesideId : undefined, generation: live.generation, beingId: live.beingId } as SendTarget;
-    if (JSON.stringify(next) !== JSON.stringify(this.sendTarget)) { $<HTMLTextAreaElement>('town-send-content').value = ''; $<HTMLInputElement>('town-recipient').value = ''; }
+    const next = { kind, firesideId: kind === 'fireside' ? firesideId : undefined, generation: live.generation, beingId: live.beingId, ...(reply ? { reply } : {}) } as SendTarget;
+    if (this.sendTarget) this.drafts.set(JSON.stringify(this.sendTarget), { content: $<HTMLTextAreaElement>('town-send-content').value, recipient: $<HTMLInputElement>('town-recipient').value });
+    while (this.drafts.size > 20) this.drafts.delete(this.drafts.keys().next().value!);
+    const draft = this.drafts.get(JSON.stringify(next));
+    $<HTMLTextAreaElement>('town-send-content').value = draft?.content || '';
+    $<HTMLInputElement>('town-recipient').value = reply?.recipient || draft?.recipient || '';
+    $<HTMLInputElement>('town-recipient').readOnly = Boolean(reply && kind === 'dm');
+    $('town-send-reply').hidden = !reply;
+    $('town-reply-preview').textContent = reply ? `${reply.author}：${reply.preview}` : '';
     this.sendTarget = next;
     $('town-send-title').textContent = kind === 'dm' ? '写私信' : kind === 'fireside' ? '在围炉说一句' : '在篝火说一句';
-    $('town-send-context').textContent = `@${live.beingId} · ${kind === 'dm' ? '仅收件 Being 可见' : kind === 'fireside' ? '围炉 #' + firesideId + ' · 成员可见' : '公开发布到篝火'}`;
+    $('town-send-context').textContent = `你将以 @${live.beingId} 的身份代发 · ${kind === 'dm' ? '仅收件 Being 可见' : kind === 'fireside' ? '围炉 #' + firesideId + ' · 成员可见' : '公开发布到篝火'}`;
     $('town-recipient-label').hidden = kind !== 'dm'; $('town-recipient').hidden = kind !== 'dm';
     $<HTMLInputElement>('town-recipient').required = kind === 'dm';
-    $<HTMLTextAreaElement>('town-send-content').maxLength = kind === 'bonfire' ? 4000 : 32000;
-    $('town-send-error').textContent = '';
+    $<HTMLTextAreaElement>('town-send-content').maxLength = kind === 'bonfire' ? 8000 : 64000;
+    $('town-send-error').textContent = ''; this.updateComposer();
     $<HTMLDialogElement>('town-send-dialog').showModal();
-    (kind === 'dm' ? $('town-recipient') : $('town-send-content')).focus();
+    (kind === 'dm' && !reply ? $('town-recipient') : $('town-send-content')).focus();
   }
   private async send() {
     const target = this.sendTarget;
@@ -190,19 +209,22 @@ export class TownViews {
     if (target.generation !== this.live.generation || target.beingId !== this.live.beingId) { $('town-send-error').textContent = 'Town 身份已改变，请重新打开发送窗口。'; return; }
     const content = $<HTMLTextAreaElement>('town-send-content').value;
     const input: TownPost = target.kind === 'dm' ? { kind: 'dm', content, recipient: $<HTMLInputElement>('town-recipient').value } : target.kind === 'fireside' ? { kind: 'fireside', content, firesideId: target.firesideId! } : { kind: 'bonfire', content };
+    if (target.reply) { if (input.kind === 'dm') input.replyTo = String(target.reply.id); else input.replyTo = Number(target.reply.id); }
     this.sendBusy = true; this.updateLive(); $('town-send-error').textContent = '';
+    $<HTMLButtonElement>('town-reply-clear').disabled = true;
     $<HTMLButtonElement>('town-send-close').disabled = true;
     $<HTMLTextAreaElement>('town-send-content').disabled = true; $<HTMLInputElement>('town-recipient').disabled = true;
     try {
       const result = await this.api.sendTown(input);
       if (target !== this.sendTarget) return;
       if (!result.ok) { $('town-send-error').textContent = result.message; return; }
+      this.drafts.delete(JSON.stringify(target));
       $<HTMLTextAreaElement>('town-send-content').value = '';
       $<HTMLDialogElement>('town-send-dialog').close();
       if (target.kind === 'dm') { this.tab = 'sent'; this.tabs.mail = 'sent'; }
       await this.load();
     } catch (error) { if (target === this.sendTarget) $('town-send-error').textContent = String(error).replace(/^Error: Error invoking remote method '[^']+': Error: /, ''); }
-    finally { this.sendBusy = false; $<HTMLButtonElement>('town-send-close').disabled = false; $<HTMLTextAreaElement>('town-send-content').disabled = false; $<HTMLInputElement>('town-recipient').disabled = false; this.updateLive(); }
+    finally { this.sendBusy = false; $<HTMLButtonElement>('town-reply-clear').disabled = false; $<HTMLButtonElement>('town-send-close').disabled = false; $<HTMLTextAreaElement>('town-send-content').disabled = false; $<HTMLInputElement>('town-recipient').disabled = false; this.updateLive(); }
   }
   show(view: string, resourceId?: string) {
     this.view = view; this.request++; this.detailRequest++;
@@ -397,6 +419,7 @@ export class TownViews {
       mail: this.view === 'mail' ? this.tab as 'inbox' | 'sent' : undefined,
       search: $<HTMLInputElement>('town-search').value, filters, limit: this.view === 'firesides' ? 50 : 100,
       private: this.view === 'firesides', onSelect: resource => this.choose(resource),
+      onReply: this.live?.phase === 'connected' ? reply => this.compose(reply) : undefined,
       onFilters: (values, count) => this.scenes.update({ count, filters: { tab: this.tab, ...values }, scope: `${count} 条符合筛选 · 最近 ${this.view === 'firesides' ? 50 : 100} 条内筛选；未确认阅读` }),
     });
   }

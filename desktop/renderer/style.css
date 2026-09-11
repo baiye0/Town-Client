@@ -48,7 +48,7 @@ body:not([data-view=chat]) #conversation-name{display:none}
 #portal-logs{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:18px;color:var(--secondary);font:11px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace;height:230px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
 .portal-foot{font-size:11px;color:var(--muted);margin-top:14px}
 dialog{padding:0;width:580px;max-height:90vh;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:16px;color:var(--text);box-shadow:0 24px 100px #0003}dialog::backdrop{background:#0004;backdrop-filter:blur(5px)}
-#settings-form,#town-auth-form,.kit-install-form{padding:28px}.dialog-heading{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}.dialog-heading h2{font-size:21px;font-weight:550}
+#settings-form,#town-auth-form,.kit-install-form,.client-settings-content{padding:28px}.dialog-heading{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}.dialog-heading h2{font-size:21px;font-weight:550}
 form>label,.field-row label{display:block;font-size:12px;margin:18px 0 7px;color:var(--secondary)}
 input:not([type=checkbox]){width:100%;border:1px solid var(--line);color:var(--text);background:var(--control);border-radius:8px;padding:10px 11px;font-size:13px;min-width:0}input::placeholder{color:var(--muted);font-size:12px}
 .field-help{font-size:11px;color:var(--muted);line-height:1.8;margin:7px 0}.picker{display:flex;gap:8px}.picker button{border:1px solid var(--line);border-radius:8px;font-size:12px;white-space:nowrap;padding:0 14px}

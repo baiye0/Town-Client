@@ -58,6 +58,9 @@ try {
     await npm('build-portal', ['run', 'build:portal']);
     await npm('package', ['run', 'package']);
   }
+  await npm('client-lifecycle', ['run', 'test:client-lifecycle']);
+  await npm('portal-runtime', ['run', 'test:portal-e2e']);
+  await npm('town-sdk', ['run', 'test:town-sdk']);
   await npm('desktop-e2e', ['run', 'test:e2e']);
   await npm('town-e2e', ['run', 'test:town-ui']);
   report.status = 'passed';

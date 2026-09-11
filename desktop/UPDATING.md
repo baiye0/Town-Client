@@ -10,6 +10,8 @@
 
 ## 升级事务
 
+日常连接或启动时发现其他配置目录/独立安装的 Portal，先走「切换到客户端 Portal」确认流程：列出旧服务，关闭其守护并确认退出，以当前客户端附带的引擎和本机设置启动。该接管使用独立的 `portal-takeover.json` 记录；取消或失败暂停，不自动恢复旧守护，不自动重试，原配置和工作文件保留。以下安装升级事务的失败回滚仅用于已管理的配套更新及此前明确确认的安装操作，不代替冲突接管确认。
+
 1. 验证安装包内 `runtime-bundle.json` 的平台、架构及引擎 SHA-256；比较原引擎版本；已有更高版本时保留该引擎，但仍更新其守护程序。
 2. 在独立运行目录暂存引擎、当前守护脚本及版本清单；原配置文件、工作目录、Kits 和配置内的路径保持原位置。复制原加密凭据或私有凭据文件，不经网页传递。
 3. 在停止前写入私有恢复日志，记录旧服务、同一用户及同一 Being 连接下的独立 Portal，以及实际启动配置和环境。
@@ -29,13 +31,13 @@
 - `npm run build:portal` 构建配套源码；`npm run make` 打包时从实际二进制读取版本、计算摘要并生成清单。不要复用未知来源或不对应源码的二进制。
 - `.github/workflows/release.yml` 手动触发时只测试和构建，用于发版前验证。确认后推送版本 tag：两个平台构建和 Windows 原生升级测试通过、包内引擎摘要核对后，先创建草稿并上传全部安装包、清单及摘要，最后公开为正式 Release。上传失败保留草稿。
 - 更新 `desktop/RELEASE_NOTES.md` 后再创建版本 tag；草稿和预发布不会提示用户更新。该首版不提供 Intel Mac 安装包。
-- 默认更新源为 `baiye0/Town-Client`。私有仓库无法匿名检测：应在构建时设置 `TOWN_UPDATE_REPOSITORY=owner/public-release-repo`（Actions 中使用同名 repository variable），只公开版本及二进制；不内置 GitHub token。保持私有时可在浏览器登录发布页下载。
+- 默认更新源为 `baiye0/Town-Client`。私有仓库无法匿名检测：应在构建时设置 `PORTAL_DESKTOP_UPDATE_REPOSITORY=owner/public-release-repo`（Actions 中使用同名 repository variable），只公开版本及二进制；不内置 GitHub token。保持私有时可在浏览器登录发布页下载。
 - 下载和安装由用户手动触发；macOS Developer ID、公证及 Windows Authenticode 仍需正式发布配置；SHA-256 检查只能校验包内一致性，不能代替签名和来源信任。
 
 ## 验证
 
 `npm test` 包含更新检查、配套切换、损坏包拒绝、升级后自动运行、失败回滚、中断恢复及 Squirrel 安装事件测试。
 
-`TOWN_NATIVE_UPGRADE_TESTS=1 npx vitest run tests/runtime-update-native.test.ts` 在 macOS 上使用隔离 profile 和真实 LaunchAgent，验证离线升级及坏引擎回滚。Windows PowerShell 中先设置 `$env:TOWN_NATIVE_UPGRADE_TESTS='1'`，同一测试验证计划任务路径；需要可用的交互式用户会话。该测试不触碰日常 Portal。Windows 实机结果应单独记录，不能用 mock 通过代替。
+`PORTAL_DESKTOP_NATIVE_UPGRADE_TESTS=1 npx vitest run tests/runtime-update-native.test.ts` 在 macOS 上使用隔离 profile 和真实 LaunchAgent，验证离线升级及坏引擎回滚。Windows PowerShell 中先设置 `$env:PORTAL_DESKTOP_NATIVE_UPGRADE_TESTS='1'`，同一测试验证计划任务路径；需要可用的交互式用户会话。该测试不触碰日常 Portal。Windows 实机结果应单独记录，不能用 mock 通过代替。
 
 Windows 发布构建还会运行实际 Setup，确认安装助手自动打开安装目录中的新客户端。macOS 安装助手使用同目录重命名与备份；无写权限时在停止 Portal 前报错。

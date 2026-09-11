@@ -25,11 +25,23 @@ export interface SaveSettings {
   portalEnvironmentPath?: string;
 }
 export type PortalPhase = 'running' | 'stopped' | 'starting' | 'connected' | 'reconnecting' | 'stopping' | 'external' | 'error';
-export interface PortalState { phase: PortalPhase; pid?: number; managed?: boolean; runtimePath?: string; message: string; logs: string[] }
+export interface PortalState { phase: PortalPhase; pid?: number; managed?: boolean; runtimePath?: string; conflict?: boolean; message: string; logs: string[] }
 export interface BackgroundState { supported: boolean; installed: boolean; enabled: boolean; running: boolean; existing: boolean; label?: string; pid?: number; message: string }
 export interface Snapshot { settings: Settings; portal: PortalState; background?: BackgroundState; notice?: string }
+export interface ClientStartup { supported: boolean; enabled: boolean; message: string }
+export interface BrowserState { open: boolean; address: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean; error?: string }
+export interface DiagnosticReport { version: string; build: string; platform: string; pid: number; startedAt: string; checkedAt: string; checks: { name: string; status: 'ok' | 'warning' | 'error'; detail: string }[]; logs: string[] }
+export interface BrowserBounds { x: number; y: number; width: number; height: number; visible: boolean }
+export type BrowserAction = 'back' | 'forward' | 'reload' | 'stop' | 'external' | 'close';
 export interface DesktopAPI {
   platform: string;
+  clientStartup(enabled?: boolean): Promise<ClientStartup>;
+  quit(): Promise<void>;
+  browserState(): Promise<BrowserState>;
+  openBrowser(url?: string): Promise<void>;
+  browserAction(action: BrowserAction): Promise<void>;
+  browserBounds(bounds: BrowserBounds): Promise<void>;
+  onBrowser(callback: (state: BrowserState) => void): () => void;
   checkUpdates(): Promise<void>;
   updateState(): Promise<import('./updates').UpdateState>;
   onUpdate(callback: (state: import('./updates').UpdateState) => void): () => void;
@@ -52,10 +64,14 @@ export interface DesktopAPI {
   openTownLink(route: string): Promise<void>;
   snapshot(): Promise<Snapshot>;
   save(input: SaveSettings): Promise<Snapshot>;
+  connectionDefaults(input: Pick<SaveSettings, 'connectionLink'>): Promise<{ portalName: string; source?: string }>;
   choose(kind: 'workspace' | 'binary'): Promise<string | null>;
   startPortal(): Promise<PortalState>;
   stopPortal(): Promise<PortalState>;
   openWorkspace(): Promise<void>;
+  diagnostics(): Promise<DiagnosticReport>;
+  exportDiagnostics(): Promise<boolean>;
+  openLoom(): Promise<void>;
   onPortal(callback: (state: PortalState) => void): () => void;
 }
 declare global { interface Window { beings: DesktopAPI } }
@@ -73,7 +89,7 @@ export interface TownLiveState {
   message: string;
   versions: Record<TownChannel, number>;
 }
-export type TownPost = { kind: 'bonfire'; content: string } | { kind: 'dm'; recipient: string; content: string } | { kind: 'fireside'; firesideId: string; content: string };
+export type TownPost = { kind: 'bonfire'; content: string; replyTo?: number } | { kind: 'dm'; recipient: string; content: string; replyTo?: string } | { kind: 'fireside'; firesideId: string; content: string; replyTo?: number };
 export interface KitTool { name: string; description: string; params?: unknown }
 export interface LocalKit { name: string; version: string; description: string; directory: string; command: string[]; tools: KitTool[]; compatible: boolean; eager: boolean; problem?: string }
 export interface KitLibrary { directory: string; enabled: boolean; kits: LocalKit[]; configPath?: string }

@@ -71,10 +71,10 @@ describe('Portal supervision', () => {
     f.children[1].emit('exit', 0); await f.portal.stop();
     await vi.advanceTimersByTimeAsync(10000); expect(f.spawn).toHaveBeenCalledTimes(2);
   });
-  it('does not kill or repeatedly restart against an existing independent service', async () => {
+  it.each([1, 73])('does not retry an instance conflict returned with exit code %s', async code => {
     const f = await fixture(); await f.portal.start(settings, connection); vi.useFakeTimers();
     f.children[0].stderr.write('another Portal instance is already running for this relay/Being\n');
-    f.children[0].emit('exit', 73);
+    f.children[0].emit('exit', code);
     expect(f.portal.state.phase).toBe('external');
     await vi.advanceTimersByTimeAsync(60000); expect(f.spawn).toHaveBeenCalledTimes(1);
     expect(f.children[0].kill).not.toHaveBeenCalled();

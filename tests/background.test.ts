@@ -11,20 +11,21 @@ async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'beings-background-')); dirs.push(root);
   const settings: Settings = { endpoint: '', being: '', hasToken: true, portalName: 'test', portalBinary: process.execPath, workspace: root, autoStart: false, backgroundEnabled: true, allowExec: false, kitsEnabled: false };
   const connection = parseConnection('https://example.org/test/?token=secret-credential');
-  let loaded = false, disabled = false, fail = false;
+  let loaded = false, disabled = false, fail = false, running = true;
   const calls: string[][] = [];
   const run: Command = async (_file, args) => {
     calls.push(args);
     if (args[0] === 'print-disabled') return disabled ? `"${service.label}" => disabled` : '';
-    if (args[0] === 'print') { if (!loaded) throw new Error('not loaded'); return 'state = running\npid = 12345'; }
+    if (args[0] === 'print') { if (!loaded) throw new Error('not loaded'); return running ? 'state = running\npid = 12345' : 'state = not running\nlast exit code = 0'; }
     if (args[0] === 'bootstrap') { if (fail) { fail = false; throw new Error('bootstrap failed'); } loaded = true; }
     if (args[0] === 'bootout') loaded = false;
     if (args[0] === 'disable') disabled = true;
     if (args[0] === 'enable') disabled = false;
+    if (args[0] === 'kickstart') running = true;
     return '';
   };
   const service = new BackgroundPortal(path.join(root, 'profile'), run, 'darwin', root);
-  return { root, settings, connection, service, run, calls, fail: () => { fail = true; } };
+  return { root, settings, connection, service, run, calls, fail: () => { fail = true; }, exited: () => { running = false; } };
 }
 it.skipIf(process.platform === 'win32')('installs an independent runtime with restricted credentials, preserves it across client instances, and disables login recovery explicitly', async () => {
   const f = await fixture();
@@ -115,9 +116,25 @@ it('registers Windows login supervision with DPAPI stdin and disables the task a
   expect(inputs.filter(Boolean)).toEqual([f.connection.link]);
   expect(scripts.join('\n')).not.toContain(f.connection.token);
   expect(scripts.join('\n')).toContain('-AtLogOn');
-  expect(scripts.join('\n')).toContain('-RestartCount 999');
+  expect(scripts.join('\n')).toContain('-RestartCount 5');
   const metadata = JSON.parse(await readFile(path.join(f.root, 'windows-profile/portal-service.json'), 'utf8'));
   expect(await readFile(path.join(metadata.root, 'connection.dpapi'), 'utf8')).toBe('encrypted-dpapi-value');
   await service.disable(); expect(service.state.enabled).toBe(false);
   expect(scripts.at(-2)).toContain('ExecutablePath -eq');
+});
+
+it.skipIf(process.platform === 'win32')('shows terminal startup failure and explicitly restarts a loaded but exited service', async () => {
+  const f = await fixture(); await f.service.enable(f.settings, f.connection);
+  const root = f.service.installedService!.root;
+  f.exited();
+  await writeFile(path.join(root, '.portal-start-failure'), 'conflict');
+  await writeFile(path.join(root, '.portal-start-attempt'), `${Math.floor(Date.now() / 1000)} 6`);
+  expect(await f.service.portalState()).toMatchObject({ phase: 'error', message: expect.stringContaining('同一个 Being') });
+  await writeFile(path.join(root, '.portal-start-failure'), 'crash-limit');
+  expect(await f.service.portalState()).toMatchObject({ phase: 'error', message: expect.stringContaining('已停止自动重试') });
+  await f.service.enable(f.settings, f.connection);
+  expect(f.calls.filter(args => args[0] === 'kickstart')).toHaveLength(1);
+  expect(f.service.state.running).toBe(true);
+  await expect(readFile(path.join(root, '.portal-start-failure'))).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(readFile(path.join(root, '.portal-start-attempt'))).rejects.toMatchObject({ code: 'ENOENT' });
 });

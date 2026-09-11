@@ -44,3 +44,61 @@ describe('Town reads', () => {
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });
+
+describe('Town SDK 2769e2f protocol', () => {
+  it('uses native reply_to fields and rejects invalid reply references before posting', async () => {
+    const fetcher = vi.fn(async () => Response.json({ ok: true }));
+    const client = new TownClient(() => 'fixture-token', fetcher as typeof fetch);
+    await client.send({ kind: 'bonfire', content: 'reply', replyTo: 123 });
+    await client.send({ kind: 'dm', recipient: 'river', content: 'reply', replyTo: 'mail-1' });
+    await client.send({ kind: 'fireside', firesideId: '10', content: 'reply', replyTo: 8 });
+    const bodies = (fetcher.mock.calls as unknown as [string, RequestInit][]).map(([, options]) => JSON.parse(String(options.body)));
+    expect(bodies).toEqual([{ message: 'reply', reply_to: 123 }, { recipient: 'river', content: 'reply', reply_to: 'mail-1' }, { fireside_id: 10, message: 'reply', reply_to: 8 }]);
+    for (const replyTo of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) await expect(client.send({ kind: 'bonfire', content: 'reply', replyTo })).rejects.toThrow('回复目标');
+    await expect(client.send({ kind: 'dm', recipient: 'river', content: 'reply', replyTo: '../another-thread' })).rejects.toThrow('回复目标');
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+  it('pairs anonymously and immediately returns the one-time client token to secure storage', async () => {
+    const fetcher = vi.fn(async () => Response.json({ ok: true, token: 'a'.repeat(64), being_id: 'willow' }));
+    const client = new TownClient(() => 'must-not-send-existing-token', fetcher as typeof fetch);
+    expect(await client.pair({ beingId: 'Willow', code: 'ab3xy9' })).toEqual({ token: 'a'.repeat(64), beingId: 'willow' });
+    const request = (fetcher.mock.calls as unknown[][])[0][1] as RequestInit;
+    expect(request.headers).toEqual({ Accept: 'application/json', 'Content-Type': 'application/json' });
+    expect(JSON.parse(request.body as string)).toEqual({ being_id: 'willow', code: 'AB3XY9' });
+  });
+  it('sends the documented bodies for all three channels without inventing via or identity events', async () => {
+    const fetcher = vi.fn(async () => Response.json({ ok: true, via: 'client:desktop', seq: 3 }));
+    const client = new TownClient(() => 'client-fixture-token', fetcher as typeof fetch);
+    for (const input of [{ kind: 'bonfire', content: '篝火' }, { kind: 'dm', recipient: 'River', content: '私信' }, { kind: 'fireside', firesideId: '10', content: '围炉' }] as const) {
+      expect(await client.send(input)).toMatchObject({ ok: true, data: { via: 'client:desktop' } });
+    }
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url, options]) => [url, JSON.parse(options.body as string)])).toEqual([
+      ['https://beings.town/api/bonfire/speak', { message: '篝火' }],
+      ['https://beings.town/api/messages', { recipient: 'River', content: '私信' }],
+      ['https://beings.town/api/fireside/speak', { fireside_id: 10, message: '围炉' }],
+    ]);
+    expect(calls.every(([, options]) => (options.headers as Record<string, string>).Authorization === 'Bearer client-fixture-token')).toBe(true);
+    expect(townRoute({ kind: 'fireside', id: '10' }).route).toBe('/api/fireside/hear?fireside_id=10&limit=50');
+  });
+  it('prevents silent bonfire truncation and oversized fireside sends using Unicode character counts', async () => {
+    const fetcher = vi.fn(async () => Response.json({ ok: true }));
+    const client = new TownClient(() => 'client-fixture-token', fetcher as typeof fetch);
+    expect(await client.send({ kind: 'bonfire', content: '🌱'.repeat(4000) })).toMatchObject({ ok: true });
+    await expect(client.send({ kind: 'bonfire', content: '🌱'.repeat(4001) })).rejects.toThrow('4000');
+    await expect(client.send({ kind: 'fireside', firesideId: '10', content: '中'.repeat(32001) })).rejects.toThrow('32000');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it('rejects self DM IDs locally, preserves server membership/recipient errors and never retries writes', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json({ error: 'cannot send message to yourself' }, { status: 400 }))
+      .mockResolvedValueOnce(Response.json({ error: 'not a member', hint: 'join the ring first' }, { status: 403 }))
+      .mockRejectedValueOnce(new Error('private connection failure'));
+    const client = new TownClient(() => 'client-fixture-token', fetcher, 'https://beings.town', () => 'willow');
+    await expect(client.send({ kind: 'dm', recipient: ' willow ', content: 'test' })).rejects.toThrow('自己');
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(await client.send({ kind: 'dm', recipient: 'Willow display name', content: 'test' })).toMatchObject({ ok: false, code: 'http', message: expect.stringContaining('cannot send message to yourself') });
+    expect(await client.send({ kind: 'fireside', firesideId: '10', content: 'test' })).toMatchObject({ ok: false, code: 'forbidden', message: expect.stringContaining('join the ring first') });
+    expect(await client.send({ kind: 'bonfire', content: 'test' })).toMatchObject({ ok: false, code: 'network', message: expect.stringContaining('可能已送达') });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+});

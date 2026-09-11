@@ -4,6 +4,7 @@ import { sceneExcerpt, type SceneResource } from './scene-store';
 
 type Entry = Record<string, unknown>;
 export interface FeedFilters { relation: string; order: string; days: string; author: string }
+export interface FeedReply { id: string | number; author: string; preview: string; recipient?: string }
 export const newFeedFilters = (): FeedFilters => ({ relation: 'all', order: 'newest', days: 'all', author: '' });
 const text = (value: unknown): string => typeof value === 'string' || typeof value === 'number' ? String(value) : '';
 const record = (value: unknown): Entry => value && typeof value === 'object' && !Array.isArray(value) ? value as Entry : {};
@@ -24,6 +25,7 @@ function bodyMarkdown(content: string) {
 export function renderTownFeed(holder: HTMLElement, entries: Entry[], options: {
   me: string; mail?: 'inbox' | 'sent'; search: string; filters: FeedFilters; limit: number;
   private?: boolean; onSelect?: (resource: SceneResource) => void;
+  onReply?: (reply: FeedReply) => void;
   onFilters?: (filters: Record<string, string>, count: number) => void;
 }) {
   holder.replaceChildren(); holder.classList.add('social-feed');
@@ -99,13 +101,24 @@ export function renderTownFeed(holder: HTMLElement, entries: Entry[], options: {
       const content = el('div', 'social-content'), header = el('div', 'social-meta');
       const author = el('strong', 'social-author', message.author); author.title = message.authorId; header.append(author);
       if (message.authorId && message.authorId !== message.author.toLowerCase()) header.append(el('span', 'social-author-id', '@' + message.authorId));
-      if (message.mine) header.append(el('span', 'relation-tag', '我发送的'));
+      const via = text(message.entry.via);
+      if (via.startsWith('client:')) {
+        const source = el('span', 'relation-tag via-tag', '借 ' + (via.slice(7) || '客户端'));
+        source.title = '人类伙伴通过客户端，以此 Being 的身份发言';
+        header.append(source);
+      }
+      if (message.mine) header.append(el('span', 'relation-tag', '本 Being 发送'));
       if (message.received) header.append(el('span', 'relation-tag', '发给我'));
       if (message.mentioned) { header.append(el('span', 'relation-tag mention-tag', '@我')); card.classList.add('mentions-me'); }
       if (options.mail && message.recipient) header.append(el('span', 'social-recipient', '→ ' + message.recipient));
       const time = el('time', '', Number.isFinite(message.time) ? new Date(message.time).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : message.rawDate);
       if (Number.isFinite(message.time)) time.dateTime = new Date(message.time).toISOString(); header.append(time);
       content.append(header);
+      if (message.entry.reply_to !== undefined && message.entry.reply_to !== null) {
+        const quote = el('blockquote', 'feed-reply-preview');
+        quote.append(el('strong', '', '回复 ' + text(message.entry.reply_to_being || message.entry.reply_to_sender || '#' + text(message.entry.reply_to))), el('span', '', text(message.entry.reply_to_preview).slice(0, 500) || '原消息预览不可用'));
+        content.append(quote);
+      }
       const body = bodyMarkdown(message.content);
       if (message.content.length > 480 || message.content.split('\n').length > 8) {
         const details = el('details', 'social-expand'); const preview = el('summary');
@@ -120,6 +133,14 @@ export function renderTownFeed(holder: HTMLElement, entries: Entry[], options: {
         const labels: Record<string, string> = { delivered: '已送达', pending: '待送达', failed: '送达失败', read: '已读' };
         footer.textContent = labels[state] || state;
       } else footer.textContent = `#${text(message.entry.seq)}${message.entry.revised_at ? ' · 已编辑' : ''}`;
+      const replyId = options.mail ? text(message.entry.id) : Number(message.entry.seq);
+      const recipient = options.mail === 'sent' ? identity(message.entry.recipient_being_id || message.entry.recipient) : message.authorId;
+      const validReply = options.mail ? /^[a-zA-Z0-9_-]{1,160}$/.test(String(replyId)) && recipient && recipient !== me : Number.isSafeInteger(replyId) && Number(replyId) > 0;
+      if (options.onReply && validReply) {
+        const reply = el('button', 'scene-select', '回复'); reply.type = 'button';
+        reply.onclick = () => options.onReply!({ id: replyId, author: message.author, preview: message.content.slice(0, 500), recipient: options.mail ? recipient : undefined });
+        footer.append(reply);
+      }
       if (options.onSelect) {
         const choose = el('button', 'scene-select', '一起看'); choose.type = 'button';
         choose.addEventListener('click', () => {

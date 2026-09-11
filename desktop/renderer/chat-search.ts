@@ -9,7 +9,7 @@ export function mountChatSearch(frame: HTMLIFrameElement, openChat: () => void) 
     toggle.setAttribute('aria-expanded', String(open));
     if (open && !panel.open) panel.showModal();
     if (!open && panel.open) panel.close();
-    if (open) { input.focus(); frame.contentWindow?.postMessage({ type: 'beings:search-request' }, 'beings://chat'); }
+    if (open) { input.focus(); if (frame.getAttribute('src')) frame.contentWindow?.postMessage({ type: 'beings:search-request' }, 'beings://chat'); }
     else document.getElementById('options-trigger')?.focus();
   }
   function render() {
@@ -38,7 +38,7 @@ export function mountChatSearch(frame: HTMLIFrameElement, openChat: () => void) 
     if (event.key === 'ArrowDown') { event.preventDefault(); const buttons = Array.from(results.querySelectorAll<HTMLButtonElement>('button')); buttons[Math.min(buttons.indexOf(document.activeElement as HTMLButtonElement) + 1, buttons.length - 1)]?.focus(); }
     if (event.key === 'ArrowUp') { event.preventDefault(); const buttons = Array.from(results.querySelectorAll<HTMLButtonElement>('button')); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); if (index <= 0) input.focus(); else buttons[index - 1].focus(); }
   });
-  frame.addEventListener('load', () => { entries = []; input.value = ''; render(); frame.contentWindow?.postMessage({ type: 'beings:search-request' }, 'beings://chat'); });
+  frame.addEventListener('load', () => { entries = []; input.value = ''; render(); if (frame.getAttribute('src')) frame.contentWindow?.postMessage({ type: 'beings:search-request' }, 'beings://chat'); });
   window.addEventListener('message', event => {
     if (event.origin !== 'beings://chat' || event.source !== frame.contentWindow || event.data?.type !== 'beings:search-index') return;
     if (event.data.revision !== new URL(frame.src).searchParams.get('revision')) return;

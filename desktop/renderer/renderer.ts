@@ -1,4 +1,8 @@
 import './style.css';
+import { mountBrowser } from './browser';
+import { mountDiagnostics } from './diagnostics';
+import { mountReading } from './reading';
+import './utilities.css';
 import './town.css';
 import { TownViews } from './town';
 import { Workspace } from './workspace';
@@ -36,7 +40,8 @@ function connectionStatus(state: string) {
 function applyTheme(next: 'light' | 'dark') {
   theme = next; document.documentElement.dataset.theme = next;
   $('theme-toggle').setAttribute('title', next === 'light' ? '切换到深色' : '切换到浅色');
-  $<HTMLIFrameElement>('chat-frame').contentWindow?.postMessage({ type: 'beings:appearance', theme: next }, 'beings://chat');
+  const frame = $<HTMLIFrameElement>('chat-frame');
+  if (frame.getAttribute('src')) frame.contentWindow?.postMessage({ type: 'beings:appearance', theme: next }, 'beings://chat');
 }
 $('theme-toggle').addEventListener('click', () => action(async () => applyTheme(await api.appearance(theme === 'light' ? 'dark' : 'light'))));
 $<HTMLIFrameElement>('chat-frame').addEventListener('load', () => {
@@ -55,6 +60,9 @@ function toast(error: unknown) {
   toastTimer = setTimeout(() => { $('toast').hidden = true; }, 6000);
 }
 async function action(operation: () => Promise<unknown>) { try { await operation(); } catch (error) { toast(error); } }
+mountBrowser(api, toast);
+mountDiagnostics(api, toast);
+mountReading();
 const workspace = new Workspace($<HTMLIFrameElement>('chat-frame'), view => setView(view), toast);
 const townViews = new TownViews(api, toast, view => setView(view), workspace.scenes, () => { setView('chat'); workspace.toggle(true); });
 function setView(view: string, resourceId?: string) {
@@ -90,6 +98,7 @@ document.querySelectorAll<HTMLElement>('[data-chat-action]').forEach(button => b
   setView('chat');
   $<HTMLIFrameElement>('chat-frame').contentWindow?.postMessage({ type: 'beings:chat-action', action: button.dataset.chatAction }, 'beings://chat');
 }));
+let portalAction: 'start' | 'stop' | null = null;
 function renderPortal(state: PortalState) {
   if (snapshot) snapshot.portal = state;
   $('portal-phase').textContent = labels[state.phase];
@@ -97,8 +106,10 @@ function renderPortal(state: PortalState) {
   $('portal-pid').textContent = state.pid ? `PID ${state.pid}${state.managed === false ? ' · 外部管理' : ''}` : '—';
   $('portal-pid').title = state.runtimePath || '';
   const stopped = ['stopped', 'error', 'external'].includes(state.phase);
-  $<HTMLButtonElement>('start-portal').disabled = !snapshot?.settings.hasToken || !stopped || state.managed === false;
-  $<HTMLButtonElement>('stop-portal').disabled = stopped || state.phase === 'stopping' || state.managed === false;
+  $<HTMLButtonElement>('start-portal').disabled = Boolean(portalAction) || !snapshot?.settings.hasToken || (!stopped && state.managed !== false);
+  $('start-portal').textContent = portalAction === 'start' ? '正在启动…' : state.managed === false ? '使用客户端 Portal' : '启动 Portal';
+  $<HTMLButtonElement>('stop-portal').disabled = Boolean(portalAction) || (stopped && !snapshot?.background?.enabled) || state.phase === 'stopping' || state.managed === false;
+  $('stop-portal').textContent = portalAction === 'stop' ? '正在停止…' : '停止';
   const log = $('portal-logs');
   const wasAtBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 32;
   log.textContent = state.logs.join('\n') || '启动 Portal 后，连接与工具运行状态会显示在这里。';
@@ -114,6 +125,7 @@ function applySnapshot(next: Snapshot, reload = false) {
   $('background-status').textContent = next.portal.managed === false ? `当前运行目录：${next.portal.runtimePath}。客户端仅观察；自启与守护状态以原管理方式为准。` : next.background?.enabled ? `${next.background.message}。点击“停止”会同时停用登录自启。` : next.background?.message || '后台服务未启用；临时启动的 Portal 随客户端退出。';
   $('conversation-name').textContent = settings.being || 'Being';
   $('workspace-label').textContent = settings.workspace;
+  $<HTMLButtonElement>('open-loom').disabled = !settings.hasToken;
   $('portal-name').textContent = settings.portalName;
   $('exec-label').textContent = settings.allowExec ? '已允许本机命令' : '未启用';
   $('kits-label').textContent = settings.kitsEnabled ? 'Kits 与自定义工具已启用' : '未启用';
@@ -128,10 +140,29 @@ function applySnapshot(next: Snapshot, reload = false) {
   }
   updateChatRefresh();
 }
+let portalNameEdited = false;
+let defaultsRevision = 0;
+let defaultsTimer: ReturnType<typeof setTimeout>;
+async function fillConnectionDefaults() {
+  const revision = ++defaultsRevision;
+  const link = $<HTMLInputElement>('connection-link').value;
+  if (!link && !snapshot?.settings.hasToken) return;
+  try {
+    const defaults = await api.connectionDefaults({ connectionLink: link });
+    if (revision !== defaultsRevision || !$<HTMLDialogElement>('settings-dialog').open) return;
+    if (!portalNameEdited) $<HTMLInputElement>('portal-name-input').value = defaults.portalName;
+    $('portal-name-help').textContent = defaults.source ? `检测到原 Portal 名称：${defaults.portalName}。${portalNameEdited ? '保留你填写的名称。' : '已默认沿用，可修改。'}` : '未发现同一 Being 的本机 Portal，可设置新名称。';
+  } catch { /* Incomplete links stay in the form; saving reports validation errors. */ }
+}
+function scheduleDefaults() { ++defaultsRevision; clearTimeout(defaultsTimer); defaultsTimer = setTimeout(() => { void fillConnectionDefaults(); }, 300); }
+$('connection-link').addEventListener('input', scheduleDefaults);
+$('portal-name-input').addEventListener('input', () => { portalNameEdited = true; });
 function showSettings() {
   if (!snapshot) return;
   const settings = snapshot.settings;
   $<HTMLInputElement>('connection-link').value = '';
+  portalNameEdited = false;
+  $('portal-name-help').textContent = '已有本机 Portal 时默认沿用名称，也可以自行修改。';
   $<HTMLInputElement>('connection-link').required = !settings.hasToken;
   $<HTMLInputElement>('connection-link').placeholder = settings.hasToken ? `${settings.endpoint}/ · 已安全保存，留空保留` : 'https://echo.beings.town/your_being/?token=…';
   $<HTMLInputElement>('portal-name-input').value = settings.portalName;
@@ -152,13 +183,65 @@ function showSettings() {
   $<HTMLInputElement>('kits-input').disabled = imported;
   $('settings-error').textContent = '';
   $<HTMLDialogElement>('settings-dialog').showModal();
+  void fillConnectionDefaults();
 }
+let changingClientStartup = false;
+function renderClientStartup(state: import('../shared').ClientStartup) {
+  $<HTMLInputElement>('client-startup-input').checked = state.enabled;
+  $<HTMLInputElement>('client-startup-input').disabled = !state.supported || changingClientStartup;
+  $('client-startup-help').textContent = state.message;
+}
+$('client-settings-button').addEventListener('click', async () => {
+  $('client-settings-error').textContent = '';
+  $<HTMLInputElement>('client-startup-input').disabled = true;
+  $<HTMLDialogElement>('client-settings-dialog').showModal();
+  try { renderClientStartup(await api.clientStartup()); }
+  catch (error) { $('client-settings-error').textContent = String(error); }
+});
+$('close-client-settings').addEventListener('click', () => $<HTMLDialogElement>('client-settings-dialog').close());
+$('client-startup-input').addEventListener('change', async () => {
+  if (changingClientStartup) return;
+  changingClientStartup = true;
+  const input = $<HTMLInputElement>('client-startup-input');
+  const enabled = input.checked;
+  input.disabled = true;
+  $('client-settings-error').textContent = '';
+  try {
+    const state = await api.clientStartup(enabled);
+    changingClientStartup = false;
+    renderClientStartup(state);
+  } catch (error) {
+    input.checked = !enabled;
+    $('client-settings-error').textContent = String(error);
+    changingClientStartup = false;
+    try { renderClientStartup(await api.clientStartup()); } catch { input.disabled = true; }
+  }
+});
+$('quit-client').addEventListener('click', () => action(() => api.quit()));
 for (const id of ['settings-button', 'connect-button', 'portal-settings']) $(id).addEventListener('click', showSettings);
 $('close-settings').addEventListener('click', () => $<HTMLDialogElement>('settings-dialog').close());
 document.querySelectorAll<HTMLElement>('[data-view]').forEach(button => button.addEventListener('click', () => setView(button.dataset.view!)));
-$('open-workspace').addEventListener('click', () => action(() => api.openWorkspace()));
-$('start-portal').addEventListener('click', () => action(async () => { renderPortal(await api.startPortal()); }));
-$('stop-portal').addEventListener('click', () => action(async () => { renderPortal(await api.stopPortal()); applySnapshot(await api.snapshot()); }));
+
+$('open-loom').addEventListener('click', () => action(() => api.openLoom()));
+$('open-town-guide').addEventListener('click', () => action(() => api.openTownLink('/')));
+async function changePortal(operation: 'start' | 'stop') {
+  if (portalAction) return;
+  portalAction = operation;
+  $('portal-action-error').hidden = true;
+  $('portal-action-error').textContent = '';
+  renderPortal(snapshot.portal);
+  try {
+    renderPortal(await (operation === 'start' ? api.startPortal() : api.stopPortal()));
+    applySnapshot(await api.snapshot());
+  } catch (error) {
+    // The Portal sheet is a modal dialog; a toast outside it is obscured.
+    $('portal-action-error').textContent = String(error instanceof Error ? error.message : error).replace(/^Error invoking remote method '[^']+': Error: /, '');
+    $('portal-action-error').hidden = false;
+  }
+  finally { portalAction = null; renderPortal(snapshot.portal); }
+}
+$('start-portal').addEventListener('click', () => { void changePortal('start'); });
+$('stop-portal').addEventListener('click', () => { void changePortal('stop'); });
 $('background-input').addEventListener('change', () => { $<HTMLInputElement>('autostart-input').disabled = $<HTMLInputElement>('background-input').checked; });
 document.querySelectorAll<HTMLElement>('[data-pick]').forEach(button => button.addEventListener('click', () => action(async () => {
   const kind = button.dataset.pick as 'workspace' | 'binary';
@@ -170,6 +253,7 @@ $('settings-form').addEventListener('submit', async event => {
   saving = true; $<HTMLButtonElement>('save-settings').disabled = true;
   $('settings-error').textContent = '';
   try {
+    if (!portalNameEdited) await fillConnectionDefaults();
     const next = await api.save({
       connectionLink: $<HTMLInputElement>('connection-link').value,
       workspace: $<HTMLInputElement>('workspace-input').value,
@@ -184,7 +268,6 @@ $('settings-form').addEventListener('submit', async event => {
     });
     $<HTMLInputElement>('connection-link').value = '';
     applySnapshot(next, true); $<HTMLDialogElement>('settings-dialog').close(); setView('chat');
-    if (next.settings.autoStart) await action(async () => { renderPortal(await api.startPortal()); });
   } catch (error) {
     $('settings-error').textContent = String(error).replace(/^Error: Error invoking remote method '[^']+': Error: /, '');
   } finally { saving = false; $<HTMLButtonElement>('save-settings').disabled = false; }
@@ -212,7 +295,7 @@ document.addEventListener('keydown', event => {
   if ((event.metaKey || event.ctrlKey) && event.key === ',') { event.preventDefault(); showSettings(); }
 });
 if (navigator.userAgent.includes('Windows')) document.querySelector('#toggle-chat-search small')!.textContent = 'Ctrl F';
-if (!api) toast('请通过 Beings 桌面客户端打开此页面。');
+if (!api) toast('请通过 portal-desktop 桌面客户端打开此页面。');
 else {
   document.documentElement.dataset.platform = api.platform;
   api.onPortal(state => { renderPortal(state); void action(async () => applySnapshot(await api.snapshot())); });
@@ -236,3 +319,5 @@ else {
   $('startup-retry').addEventListener('click', () => { void initialize(); });
   void initialize();
 }
+
+$('open-workspace').addEventListener('click', () => action(() => api.openWorkspace()));

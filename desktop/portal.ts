@@ -55,7 +55,7 @@ export class PortalSupervisor extends EventEmitter {
   private launch() {
     if (!this.wanted || !this.run) return;
     const { settings, connection, configPath } = this.run;
-    this.publish({ phase: 'starting', message: '正在启动本机 Portal…', pid: undefined, managed: true, runtimePath: undefined });
+    this.publish({ phase: 'starting', message: '正在启动本机 Portal…', pid: undefined, managed: true, runtimePath: undefined, conflict: false });
     const startedAt = Date.now();
     const nonce = randomUUID();
     const root = this.directory;
@@ -70,6 +70,7 @@ export class PortalSupervisor extends EventEmitter {
     });
     this.child = child;
     this.publish({ pid: child.pid });
+    let conflict = false;
     for (const stream of [child.stdout, child.stderr]) {
       const decoder = new StringDecoder('utf8');
       let pending = '';
@@ -77,7 +78,10 @@ export class PortalSupervisor extends EventEmitter {
         pending += decoder.write(chunk);
         const lines = pending.split(/\r?\n/);
         pending = lines.pop() || '';
-        for (const line of lines) this.line(line);
+        for (const line of lines) {
+          if (/another (legacy )?Portal instance is already running/.test(line)) conflict = true;
+          this.line(line);
+        }
         // Drop oversized incomplete lines, rather than exposing secrets split at chunk boundaries.
         if (pending.length > 64_000) pending = '';
       });
@@ -112,9 +116,9 @@ export class PortalSupervisor extends EventEmitter {
       // Tool processes may inherit pipes. Never use the 'close' event to gate recovery.
       child.stdout?.destroy(); child.stderr?.destroy();
       if (error) this.line(error.message);
-      if (code === 73) {
+      if (code === 73 || conflict) {
         this.wanted = false;
-        this.publish({ phase: 'external', message: '已有独立 Portal 服务运行；客户端不会接管或停止该服务。' });
+        this.publish({ phase: 'external', conflict: true, message: '同一个 Being 已有本机 Portal 在运行，已停止重复启动；等待确认切换到客户端 Portal。' });
       }
       if (!this.wanted) {
         this.publish({ pid: undefined, ...(this.state.phase === 'external' ? {} : { phase: 'stopped', message: '本机 Portal 已停止' }) });

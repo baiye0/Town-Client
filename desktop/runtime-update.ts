@@ -147,7 +147,7 @@ export class RuntimeUpdater {
       throw new Error(`Portal 更新失败，已恢复旧服务：${String(error)}`);
     }
   }
-  private async waitReady(service: Service) {
+  async waitReady(service: Service) {
     const deadline = Date.now() + 25_000;
     let identity = '', since = 0;
     while (Date.now() < deadline) {

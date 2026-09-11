@@ -1,2 +1,5 @@
 import { defineConfig } from 'vite';
-export default defineConfig({ define: { TOWN_UPDATE_REPOSITORY: JSON.stringify(process.env.TOWN_UPDATE_REPOSITORY || 'baiye0/Town-Client') }, build: { rollupOptions: { external: ['electron'] } } });
+import { execFileSync } from 'node:child_process';
+let revision = 'local';
+try { revision = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim(); } catch { /* Source archive. */ }
+export default defineConfig({ define: { PORTAL_DESKTOP_BUILD: JSON.stringify(`${revision} · ${new Date().toISOString()}`), PORTAL_DESKTOP_UPDATE_REPOSITORY: JSON.stringify(process.env.PORTAL_DESKTOP_UPDATE_REPOSITORY || 'baiye0/Town-Client') }, build: { rollupOptions: { external: ['electron'] } } });

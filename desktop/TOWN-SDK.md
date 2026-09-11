@@ -1,6 +1,21 @@
 # Town SDK 接入状态
 
-2026-09-10。依据 [官方 SDK 指南](https://github.com/jeremyliu16/beings-town-client-sdk/blob/db02a4269b8078967841e6da543b70ac296c62c4/client-sdk-guide.md) 与 [参考客户端](https://github.com/jeremyliu16/beings-town-client-sdk/blob/db02a4269b8078967841e6da543b70ac296c62c4/examples/reference-client.html)。该仓库提供协议与示例，不是需要安装的 npm 库。
+2026-09-11。依据 [官方 SDK 指南](https://github.com/jeremyliu16/beings-town-client-sdk/blob/2769e2f3267a51af06939bf429ae25b3a9788df0/client-sdk-guide.md) 与 [参考客户端](https://github.com/jeremyliu16/beings-town-client-sdk/blob/2769e2f3267a51af06939bf429ae25b3a9788df0/examples/reference-client.html)。该仓库提供协议与示例，不是需要安装的 npm 库。
+
+## 2769e2f 对照结论
+
+本次上游补充读写字段、来源标识和服务端行为，既有端点与鉴权方式保持兼容。
+
+| 项目 | 客户端处理 |
+| --- | --- |
+| `via=client:<name>` | 篝火、私信、围炉均显示「借 name」，说明是伙伴通过客户端代发；Being 本体及未提供来源的旧消息不推测客户端来源。标记使用纯文本渲染。 |
+| 发言身份 | composer 明示以哪个 Being 身份代发，消息的本 Being 标记不再称为「我发送的」。展示名沿用服务端字段。 |
+| 私信给自己 | 已确认的自身 Being ID 在本地拦截；显示名解析、歧义及自身别名仍由服务端判定并返回错误。 |
+| 长度与成员权限 | 保留篝火 4000 / 围炉 32000 字的发送前校验，避免篝火静默截断；成员权限由服务端 403 判定。围炉读取显式指定最近 50 条。 |
+| `identity.action` | Town 在 client token 发言后投递到 Heart inbox，客户端不额外投递，避免重复事件。该回流不等同于客户端阅读场景同步。 |
+| 配对、token、SSE | 现有匿名配对、加密保存、REST Bearer、SSE query token、hello client 身份确认及分频道去重保持不变。 |
+| IP Trust | 非 client 的 hello 仍拒绝作为客户端身份启用写操作；client token 行为实测须从非 Hearth IP 发起。 |
+| `reply_to` | 已接入三处原生回复：篝火/围炉使用数字 seq，私信使用消息 id；展示服务端原消息预览，私信回复锁定收件人。 |
 
 ## 已完成
 
@@ -25,4 +40,10 @@
 
 ## 验证记录
 
-本轮按伙伴要求不运行自动化测试；使用 TypeScript 类型检查、macOS arm64 打包和客户端只读界面检查，均已完成。实机确认 Town hello 身份、篝火读取、私信收/发标签，以及篝火与私信发送预览正常。没有向真实篝火、私信或围炉提交验证消息，写入链路仍需获授权的端到端验收。Windows 实机、断网/休眠恢复与大量事件压力验证也仍待完成，不能用构建成功替代这些验证。
+2026-09-10 曾完成真实 Town 的只读界面检查。本次增加 `tests/town.test.ts` 的协议断言、`tests/town-live.test.ts` 的 SDK SSE 字段/去重/身份边界测试，以及 `npm run test:town-sdk` 的真实 Electron + 本地协议 fixture 验证（配对、三类 feed 来源标记、发送身份与自发私信拦截）。测试不会向真实 Town 发消息，也不会签发真实 token。
+
+真实云端发言后的 `via` 与 Heart `identity.action` 回流仍需获授权的端到端验收；Windows 实机、断网/休眠恢复与大量事件压力验证仍待完成。
+
+## 原生能力的界面完善（2026-09-11）
+
+消息卡片增加回复与原文预览；发送窗口显示按 Unicode 字符计数的上限，支持 Command/Ctrl + Enter。切换回复目标时保留本次运行内的草稿，身份变化时清空；未收到发送确认时保留正文并提示先核对，不自动重发。跨私信对象、跨围炉回复仍由原服务端校验。没有扩展服务端协议或增加多会话。

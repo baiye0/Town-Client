@@ -10,8 +10,8 @@ export class SettingsStore {
   connection: Connection | null = null;
   settings: Settings;
   constructor(private directory: string, private storage: SecretStorage, binary: string) {
-    this.settings = { endpoint: '', being: '', hasToken: false, workspace: path.join(os.homedir(), 'Beings Workspace'),
-      portalBinary: binary, portalName: `beings-${os.hostname().replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 50)}`,
+    this.settings = { endpoint: '', being: '', hasToken: false, workspace: path.join(os.homedir(), 'portal-desktop Workspace'),
+      portalBinary: binary, portalName: `portal-desktop-${os.hostname().replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 50)}`,
       autoStart: false, backgroundEnabled: true, allowExec: false, kitsEnabled: false };
   }
   async load() {
@@ -28,8 +28,7 @@ export class SettingsStore {
   }
   async save(input: SaveSettings) {
     if (!input || typeof input !== 'object') throw new Error('无效的设置。');
-    const connection = input.connectionLink?.trim() ? parseConnection(input.connectionLink) : this.connection;
-    if (!connection) throw new Error('请先输入 Being 链接。');
+    const connection = this.resolveConnection(input);
     if (!this.storage.isEncryptionAvailable()) throw new Error('系统密钥库不可用，无法安全保存连接。请启用系统密钥库后重试。');
     if (typeof input.workspace !== 'string' || !path.isAbsolute(input.workspace)) throw new Error('请选择绝对路径的工作目录。');
     if (typeof input.portalBinary !== 'string' || !path.isAbsolute(input.portalBinary)) throw new Error('请选择 Portal 可执行文件。');
@@ -53,5 +52,10 @@ export class SettingsStore {
     await rename(temporary, path.join(this.directory, 'connection.json'));
     this.connection = connection;
     this.settings = next;
+  }
+  resolveConnection(input: Pick<SaveSettings, 'connectionLink'>): Connection {
+    const connection = input.connectionLink?.trim() ? parseConnection(input.connectionLink) : this.connection;
+    if (!connection) throw new Error('请先输入 Being 链接。');
+    return { ...connection };
   }
 }

@@ -11,7 +11,7 @@ import { parseConnection } from '../desktop/connection';
 import type { Settings } from '../desktop/shared';
 import { PortalSupervisor } from '../desktop/portal';
 
-it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('runs the bundled engine in the foreground without relocating or starting a second supervisor', async () => {
+it.skipIf(process.env.PORTAL_DESKTOP_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('runs the bundled engine in the foreground without relocating or starting a second supervisor', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'town-foreground-'));
   const portal = new PortalSupervisor(root);
   const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
@@ -39,7 +39,7 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
   } finally { await portal.stop(); await rm(root, { recursive: true, force: true }); }
 }, 30_000);
 
-it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('replaces the real OS supervisor offline, then restores the prior runtime after a bad candidate', async () => {
+it.skipIf(process.env.PORTAL_DESKTOP_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('replaces the real OS supervisor offline, then restores the prior runtime after a bad candidate', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'town-native-upgrade-'));
   const directory = path.join(root, 'profile');
   const background = new BackgroundPortal(directory);
@@ -99,14 +99,14 @@ it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].
 // Includes a deliberate 25 s startup failure plus real OS stop/start commands.
 }, 120_000);
 
-it.skipIf(process.env.TOWN_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('takes over an independent Portal and supervisor after a manual client upgrade', async () => {
+it.skipIf(process.env.PORTAL_DESKTOP_NATIVE_UPGRADE_TESTS !== '1' || !['darwin', 'win32'].includes(process.platform))('takes over an independent Portal and supervisor after a manual client upgrade', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'town-manual-upgrade-'));
   const directory = path.join(root, 'profile');
   const background = new BackgroundPortal(directory);
   const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
   const oldRoot = path.join(os.homedir(), '.heart-portal', 'clients', path.basename(root), 'old runtime with spaces');
   const { mkdir } = await import('node:fs/promises'); await mkdir(oldRoot, { recursive: true, mode: 0o700 });
-  const oldBinary = path.join(oldRoot, path.basename(binary)); await copyFile(process.env.TOWN_TEST_EXTERNAL_PORTAL || binary, oldBinary); await chmod(oldBinary, 0o700);
+  const oldBinary = path.join(oldRoot, path.basename(binary)); await copyFile(process.env.PORTAL_DESKTOP_TEST_EXTERNAL_PORTAL || binary, oldBinary); await chmod(oldBinary, 0o700);
   const configPath = path.join(oldRoot, 'custom config.toml');
   const settings: Settings = { endpoint: '', being: '', hasToken: true, portalName: 'manual-upgrade', portalBinary: binary, workspace: oldRoot, autoStart: true, backgroundEnabled: true, allowExec: false, kitsEnabled: false };
   const { portalConfig } = await import('../desktop/portal');

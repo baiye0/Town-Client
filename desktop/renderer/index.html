@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* ws://127.0.0.1:*; frame-src beings://chat; img-src 'self' data:; base-uri 'none'; form-action 'none'">
-  <title>Beings</title>
+  <title>portal-desktop</title>
   <link rel="icon" type="image/png" href="../../resources/branding/app.png">
 </head>
 <body>
   <section id="startup-screen" class="startup-screen" aria-busy="true" aria-label="客户端启动">
     <div class="startup-content">
-      <img src="../../resources/branding/logo.png" alt="Town-Client" width="56" height="56">
+      <img src="../../resources/branding/logo.png" alt="portal-desktop" width="56" height="56">
       <span id="startup-spinner" class="startup-spinner" aria-hidden="true"></span>
       <p id="startup-message" role="status">正在加载配置并恢复连接…</p>
       <button id="startup-retry" class="secondary" hidden>重试</button>
@@ -25,11 +25,13 @@
         <div class="options-menu">
           <button id="toggle-chat-search" aria-controls="chat-search-panel" aria-expanded="false">查找对话 <small>⌘ F</small></button>
           <button id="refresh-chat" disabled>刷新对话</button>
+          <button id="open-loom" disabled>打开原版 Loom</button>
           <button data-chat-action="model">模型设置</button><button data-chat-action="being">关于 Being</button>
           <div class="options-divider"></div>
           <button data-view="town">小镇</button><button data-view="kits">工具</button><button data-view="portal">本机连接</button><button id="open-workspace">工作目录</button>
+          <button id="open-browser">浏览器</button><button id="open-town-guide">小镇说明</button>
           <div class="options-divider"></div>
-          <button id="check-updates">检查更新</button><button id="settings-button">连接设置</button><button id="theme-toggle">切换配色</button><button data-chat-action="privacy">隐私说明</button>
+          <button id="open-diagnostics">连接诊断</button><button id="check-updates">检查更新</button><button id="settings-button">连接设置</button><button id="client-settings-button">客户端设置</button><button id="theme-toggle">切换配色</button><button data-chat-action="privacy">隐私说明</button><button id="quit-client">退出客户端</button>
           <span id="cloud-status">尚未连接</span>
         </div>
       </details>
@@ -39,7 +41,7 @@
     <div class="scene-ribbon"><div class="scene-place"><span class="scene-orbit" aria-hidden="true">◉</span><div><span id="scene-caption" class="scene-caption">此刻，你在这里</span><h1 id="scene-location">与你的 Being 交谈</h1></div></div><div class="scene-ribbon-end"><span id="scene-invitation">选中一段内容，邀请 Being 一起看</span><button id="toggle-companion" aria-controls="companion-panel" aria-expanded="false" hidden>继续这个话题 <span aria-hidden="true">↗</span></button></div></div>
     <section id="chat-view" class="view">
       <div id="welcome" hidden>
-        <div class="welcome-intro"><img class="welcome-logo" src="../../resources/branding/logo.png" alt="Town-Client" width="88" height="88"><h1>从一个想法开始</h1><p>连接你的 Being，继续对话。</p></div>
+        <div class="welcome-intro"><img class="welcome-logo" src="../../resources/branding/logo.png" alt="portal-desktop" width="88" height="88"><h1>从一个想法开始</h1><p>连接你的 Being，继续对话。</p></div>
         <button class="welcome-connect" id="connect-button"><span>连接我的 Being</span><span class="welcome-connect-arrow" aria-hidden="true">↗</span></button>
       </div>
       <iframe id="chat-frame" title="Being 对话" hidden sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads"></iframe>
@@ -51,8 +53,19 @@
       <button id="scene-compose" class="primary" disabled>放入对话 <span aria-hidden="true">↗</span></button><p class="scene-disclosure">保留出处，放入草稿，由你发送。</p>
       <div class="object-actions"><button id="scene-return">回到来源</button><button id="scene-clear">结束这个话题</button></div>
     </aside>
+    <div id="browser-divider" role="separator" tabindex="0" aria-label="调整浏览器宽度" aria-orientation="vertical" aria-controls="browser-panel" aria-valuemin="25" aria-valuemax="75" aria-valuenow="49" title="拖动调整宽度，双击恢复默认" hidden></div>
+    <aside id="browser-panel" aria-label="内置浏览器" hidden>
+      <div class="browser-heading"><strong id="browser-title">浏览器</strong><button id="browser-external" title="在系统浏览器打开" aria-label="在系统浏览器打开">↗</button><button id="browser-close" aria-label="关闭浏览器">×</button></div>
+      <form id="browser-address-form"><button type="button" id="browser-back" aria-label="后退">←</button><button type="button" id="browser-forward" aria-label="前进">→</button><button type="button" id="browser-reload" aria-label="刷新网页">↻</button><input id="browser-address" aria-label="网页地址" placeholder="输入网址" autocomplete="off" spellcheck="false"><button type="submit">前往</button></form>
+      <div id="browser-viewport"><p id="browser-message" role="status">输入网址，或从更多选项打开原版 Loom、小镇说明。</p></div>
+    </aside>
     </div>
   </main>
+  <dialog id="diagnostics-dialog" class="utility-dialog" aria-labelledby="diagnostics-heading">
+    <div class="dialog-heading"><h2 id="diagnostics-heading">连接诊断</h2><button id="diagnostics-close" class="close" aria-label="关闭诊断"></button></div>
+    <p id="diagnostics-version" class="utility-subtitle"></p><div id="diagnostics-checks" aria-live="polite"></div>
+    <div class="files-footer"><button id="diagnostics-refresh">重新检查</button><button id="diagnostics-export">导出诊断…</button></div>
+  </dialog>
   <dialog id="place-sheet" aria-labelledby="view-title">
     <div class="place-sheet-heading"><h1 id="view-title">小镇</h1><button id="back-to-chat" class="icon-button close" aria-label="回到对话" title="回到对话"></button></div>
     <section id="portal-view" class="view" hidden>
@@ -63,6 +76,7 @@
           <div class="portal-card-top"><span class="portal-symbol">⌘</span><div><h2 id="portal-name">Heart Portal</h2><span id="portal-message">本机 Portal 尚未启动</span></div><span class="status-pill" id="portal-phase">未启动</span></div>
           <div class="portal-details"><div><small>工作目录</small><span id="workspace-label">—</span></div><div><small>运行进程</small><span id="portal-pid">—</span></div></div>
           <div class="portal-actions"><button class="primary" id="start-portal">启动 Portal</button><button class="secondary" id="stop-portal" disabled>停止</button><button class="text-button" id="portal-settings">本机设置 ↗</button></div>
+          <p id="portal-action-error" class="form-error" role="alert" hidden></p>
         </div>
         <div class="capabilities"><div><span>▱</span><strong>文件与搜索</strong><small>读写选定的工作目录</small></div><div><span>⌘</span><strong>命令执行</strong><small id="exec-label">未启用</small></div><div><span>◇</span><strong>扩展工具</strong><small id="kits-label">未启用</small></div></div>
         <div class="log-heading"><h2>运行日志</h2><span>最近 300 行 · 凭据已脱敏</span></div>
@@ -90,9 +104,10 @@
       <div class="dialog-heading"><h2 id="town-send-title">写一句</h2><button id="town-send-close" type="button" class="close" aria-label="关闭发送窗口"></button></div>
       <p id="town-send-context" class="field-help"></p>
       <label id="town-recipient-label" for="town-recipient">收件 Being</label><input id="town-recipient" autocomplete="off" maxlength="160" placeholder="Being ID 或准确显示名">
+      <div id="town-send-reply" hidden><blockquote id="town-reply-preview"></blockquote><button id="town-reply-clear" type="button">取消回复</button></div>
       <label for="town-send-content">内容</label><textarea id="town-send-content" rows="6" required placeholder="写下想说的话…"></textarea>
       <p id="town-send-error" class="form-error" role="alert"></p>
-      <div class="dialog-footer"><span>以当前配对的 Being 身份发送</span><button id="town-send-submit" type="submit" class="primary">发送</button></div>
+      <div class="dialog-footer"><span id="town-send-count" aria-live="polite">0 字</span><span class="send-shortcut">⌘ / Ctrl + Enter 发送</span><button id="town-send-submit" type="submit" class="primary">发送</button></div>
     </form>
   </dialog>
   <dialog id="town-auth-dialog">
@@ -107,25 +122,37 @@
       <div class="dialog-footer"><button type="button" id="clear-town-token" class="text-button">断开本机配对</button><button type="submit" class="primary">确认配对</button></div>
     </form>
   </dialog>
+  <dialog id="client-settings-dialog" aria-labelledby="client-settings-title">
+    <div class="client-settings-content">
+      <div class="dialog-heading"><h2 id="client-settings-title">客户端设置</h2><button type="button" id="close-client-settings" class="close" aria-label="关闭客户端设置"></button></div>
+      <p class="field-help">关闭窗口后，客户端继续运行。点击托盘图标或重新打开应用可恢复窗口；选择「退出客户端」才会结束运行。</p>
+      <div class="switch-list">
+        <label><span><strong>开机自启客户端</strong><small id="client-startup-help">正在读取系统设置…</small></span><input id="client-startup-input" type="checkbox" role="switch" disabled></label>
+      </div>
+      <p class="form-error" id="client-settings-error" role="alert"></p>
+      <div class="reading-setting"><label for="reading-size">阅读字号 <output id="reading-size-value" for="reading-size">15 px</output></label><input id="reading-size" type="range" min="13" max="21" step="1" value="15"><button id="reading-reset" type="button">恢复默认</button><p class="field-help">调整对话与 Town 正文字号，立即预览并记住设置。</p></div>
+    </div>
+  </dialog>
   <dialog id="settings-dialog">
     <form id="settings-form">
       <div class="dialog-heading"><div><h2>连接与设置</h2></div><button type="button" id="close-settings" class="close" aria-label="关闭设置"></button></div>
-      <label for="connection-link">Being 链接</label>
+      <label for="connection-link">Being 完整连接地址</label>
       <input id="connection-link" type="password" autocomplete="off" spellcheck="false" placeholder="https://echo.beings.town/your_being/?token=…">
-      <p class="field-help" id="connection-help">粘贴完整的 Loom 链接。凭据加密保存在系统密钥库支持的本地配置中。</p>
+      <p class="field-help" id="connection-help">粘贴包含 token 的完整 Loom 地址，Being 由地址确定。凭据加密保存在系统密钥库支持的本地配置中。</p>
       <div class="field-row"><div><label for="portal-name-input">本机 Portal 名称</label><input id="portal-name-input" required maxlength="80" pattern="[a-zA-Z0-9_-]+"></div></div>
+      <p id="portal-name-help" class="field-help">已有本机 Portal 时默认沿用名称，也可以自行修改。</p>
       <label for="workspace-input">工作目录</label><div class="picker"><input id="workspace-input" required><button type="button" data-pick="workspace">选择…</button></div>
       <label for="binary-input">Portal 可执行文件</label><div class="picker"><input id="binary-input" required><button type="button" data-pick="binary">选择…</button></div>
       <p class="field-help">默认使用随客户端附带的 Rust 引擎，也可以选择已有的 heart-portal。</p>
       <p class="field-help" id="existing-config-note" hidden></p>
       <div class="switch-list">
-        <label><span><strong>Portal 后台常驻与登录自启</strong><small>保存后立即启用，退出客户端后继续运行；异常退出自动重启</small></span><input id="background-input" type="checkbox" role="switch"></label>
+        <label><span><strong>Portal 后台常驻与登录自启</strong><small>退出客户端后继续运行；连续故障最多重试 5 次</small></span><input id="background-input" type="checkbox" role="switch"></label>
         <label><span><strong>仅随客户端启动 Portal</strong><small>未启用后台常驻时生效，退出客户端后停止</small></span><input id="autostart-input" type="checkbox" role="switch"></label>
         <label><span><strong>允许命令执行</strong><small>Being 可以用当前用户权限运行本机命令</small></span><input id="exec-input" type="checkbox" role="switch"></label>
         <label><span><strong>启用 Kits 与自定义工具</strong><small>加载已安装的扩展及工作目录中的工具配置</small></span><input id="kits-input" type="checkbox" role="switch"></label>
       </div>
       <p class="form-error" id="settings-error" role="alert"></p>
-      <div class="dialog-footer"><span>聊天不要求启动本机 Portal</span><button class="primary" id="save-settings" type="submit">保存并连接</button></div>
+      <div class="dialog-footer"><span>验证连接成功后启动 Portal</span><button class="primary" id="save-settings" type="submit">保存、连接并启动</button></div>
     </form>
   </dialog>
   <div id="toast" role="status" hidden></div>

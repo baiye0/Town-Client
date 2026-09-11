@@ -24,6 +24,12 @@ it('persists credentials encrypted, reloads and preserves them on workspace-only
     expect(reopened.connection?.relaySecret).toBe('relay-secret');
     await reopened.save({ ...reopened.settings, portalName: 'new-name' });
     expect(reopened.connection?.token).toBe('private-test-credential');
+    expect(reopened.settings).toMatchObject({ being: 'alice', endpoint: 'https://echo.example/alice', portalName: 'new-name' });
+    expect(reopened.connection).toMatchObject({ relaySecret: 'relay-secret', link: 'https://echo.example/alice/?token=private-test-credential' });
+    await expect(reopened.save({ ...reopened.settings, connectionLink: 'another_being' })).rejects.toThrow('完整的 Being 链接');
+    await reopened.save({ ...reopened.settings, connectionLink: 'https://other.example/another_being/?token=new-credential&secret=new-relay-secret', portalName: 'my-laptop' });
+    expect(reopened.settings).toMatchObject({ being: 'another_being', endpoint: 'https://other.example/another_being', portalName: 'my-laptop' });
+    expect(reopened.connection).toMatchObject({ relaySecret: 'new-relay-secret', token: 'new-credential', link: 'https://other.example/another_being/?token=new-credential' });
     const unavailable = new SettingsStore(dir, { ...storage, isEncryptionAvailable: () => false }, process.execPath);
     await expect(unavailable.save({ ...store.settings, connectionLink: 'https://echo.example/alice/?token=test' })).rejects.toThrow('密钥库');
     await expect(store.save({ ...store.settings, portalName: 'bad\nname' })).rejects.toThrow();

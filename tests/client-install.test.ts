@@ -31,7 +31,7 @@ it('journals all launch records before stopping and resumes after a cancelled in
 });
 
 it('selects only supported assets, requires one digest and generates wait/replace/relaunch handoffs', () => {
-  expect(assetName('0.1.4', 'win32', 'x64')).toBe('Town-Client-0.1.4-windows-x64-Setup.exe');
+  expect(assetName('0.1.4', 'win32', 'x64')).toBe('portal-desktop-0.1.4-windows-x64-Setup.exe');
   expect(() => assetName('../bad', 'darwin', 'arm64')).toThrow();
   expect(() => assetName('0.1.4', 'darwin', 'x64')).toThrow();
   const row = 'a'.repeat(64) + '  fixture.zip';
@@ -44,5 +44,5 @@ it('selects only supported assets, requires one digest and generates wait/replac
   expect(mac).toContain('/usr/bin/open -n');
   const windows = windowsInstallerScript(123, 'C:\\Setup.exe', 'C:\\old.exe');
   expect(windows.indexOf('Wait-Process')).toBeLessThan(windows.indexOf('Start-Process'));
-  expect(windows).toContain("'--processStart','beings.exe'");
+  expect(windows).toContain("'--processStart','portal-desktop.exe'");
 });

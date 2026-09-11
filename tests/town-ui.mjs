@@ -1,5 +1,5 @@
 // Exercise the packaged application's real IPC and net.fetch with intercepted HTTPS fixtures.
-import { _electron as electron } from 'playwright';
+import { launchDesktop } from './support/electron-lifecycle.mjs';
 import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { c as archive } from 'tar';
 import path from 'node:path';
@@ -17,7 +17,7 @@ try {
 if(process.env.FIXTURE_API_KEY!=='fixture-value')throw Error('missing config');
 readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id==null)return;const result=r.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}:{tools:[{name:'downloaded_ping',description:'Downloaded tool',inputSchema:{type:'object'}}]};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n');});`);
   const bundle = path.join(dir, 'kit.tar.gz'); await archive({ gzip: true, cwd: remote, file: bundle }, ['manifest.json', 'package.json', 'server.mjs']);
-  app = await electron.launch({ executablePath, env: { ...process.env, BEINGS_USER_DATA: path.join(dir, 'profile') } });
+  app = await launchDesktop({ executablePath, env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(dir, 'profile') } });
   const page = await app.firstWindow();
   await app.context().tracing.start({ screenshots: true, snapshots: true });
   const config = path.join(dir, 'portal.toml');

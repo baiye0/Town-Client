@@ -1,6 +1,6 @@
 // Runs the packaged Electron app against a local HTTP + WSS fixture and the real Rust engine.
 // Never sends a chat or executes a tool against a real Being.
-import { _electron as electron } from 'playwright';
+import { launchDesktop } from './support/electron-lifecycle.mjs';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'node:http';
 import { mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises';
@@ -90,7 +90,7 @@ function cleanup() {
   return cleanupPromise ??= (async () => {
     if (app) await app.close().catch(() => {});
     if (backgroundTest) {
-      const label = 'town.beings.desktop.portal.' + createHash('sha256').update(path.join(dir, 'profile')).digest('hex').slice(0, 16);
+      const label = 'town.beings.portal-desktop.portal.' + createHash('sha256').update(path.join(dir, 'profile')).digest('hex').slice(0, 16);
       const run = promisify(execFile);
       await run('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${label}`]).catch(() => {});
       await rm(path.join(homedir(), 'Library/LaunchAgents', label + '.plist'), { force: true });
@@ -105,14 +105,14 @@ for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
   process.once(signal, () => { void cleanup().finally(() => process.exit(code)); });
 }
 try {
-  app = await electron.launch({ executablePath, env: { ...process.env, BEINGS_USER_DATA: path.join(dir, 'profile') } });
+  app = await launchDesktop({ executablePath, env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(dir, 'profile') } });
   const page = await app.firstWindow();
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.getByRole('button', { name: '连接我的 Being' }).click();
   await page.locator('#connection-link').fill(`http://127.0.0.1:${port}/willow/?token=${token}`);
   await page.locator('#workspace-input').fill(path.join(dir, '工作目录'));
   await page.locator('#background-input').uncheck();
-  await page.getByRole('button', { name: '保存并连接' }).click();
+  await page.getByRole('button', { name: '保存、连接并启动' }).click();
   await page.waitForFunction(() => !document.querySelector('#settings-dialog').open, { timeout: 15000 });
   const frame = page.frameLocator('#chat-frame');
   await frame.getByText('你好，我在这里。我们可以从一个想法开始。').waitFor();
@@ -134,7 +134,6 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   await writeFile(importedConfig, `workspace = ${JSON.stringify(path.join(dir, '工作目录'))}\nkits_dir = ${JSON.stringify(path.join(dir, 'kits'))}\nkits_enabled = true\n[tools]\nexec = false\nscreenshot = false\n`);
   await page.evaluate(async config => { const { settings } = await window.beings.snapshot(); await window.beings.save({ ...settings, portalConfigPath: config, kitsEnabled: true }); }, importedConfig);
   await page.locator('nav [data-view="portal"]').click();
-  await page.getByRole('button', { name: '启动 Portal', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('#portal-phase').textContent === '已连接', { timeout: 20000 });
   pid = (await page.evaluate(() => window.beings.snapshot())).portal.pid;
   const list = await rpc('tools/list');
@@ -267,7 +266,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   await app.close(); app = null;
   assert.throws(() => process.kill(pid, 0), /ESRCH/);
   // Reload encrypted settings from disk, without asking for the token again.
-  app = await electron.launch({ executablePath, env: { ...process.env, BEINGS_USER_DATA: path.join(dir, 'profile') } });
+  app = await launchDesktop({ executablePath, env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(dir, 'profile') } });
   const restored = await app.firstWindow();
   await restored.frameLocator('#chat-frame').getByText('本机 Portal 已完成操作。', { exact: false }).waitFor();
   await restored.frameLocator('#chat-frame').getByRole('button', { name: /跳转到提问.*请帮我写一份问候/ }).waitFor();
@@ -310,7 +309,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     const loginDeadline = Date.now() + 20000;
     while (handshakeCount === beforeLogin && Date.now() < loginDeadline) await new Promise(resolve => setTimeout(resolve, 250));
     assert(handshakeCount > beforeLogin, 'loading the saved login registration must connect without launching the client');
-    app = await electron.launch({ executablePath, env: { ...process.env, BEINGS_USER_DATA: path.join(dir, 'profile') } });
+    app = await launchDesktop({ executablePath, env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(dir, 'profile') } });
     const reopened = await app.firstWindow();
     await reopened.waitForFunction(() => document.querySelector('#portal-phase').textContent === '已连接', { timeout: 15000 });
     const reattached = await reopened.evaluate(() => window.beings.snapshot());
@@ -337,7 +336,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     assert.equal(stopped.background.enabled, false); assert.equal(stopped.settings.backgroundEnabled, false);
     await reopened.waitForTimeout(1000); assert.throws(() => process.kill(pid, 0), /ESRCH/);
     await app.close(); app = null;
-    app = await electron.launch({ executablePath, env: { ...process.env, BEINGS_USER_DATA: path.join(dir, 'profile') } });
+    app = await launchDesktop({ executablePath, env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(dir, 'profile') } });
     const disabledWindow = await app.firstWindow();
     await disabledWindow.waitForFunction(() => document.querySelector('#being-label').textContent === 'willow');
     assert.equal((await disabledWindow.evaluate(() => window.beings.snapshot())).background.enabled, false);

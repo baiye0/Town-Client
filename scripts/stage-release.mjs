@@ -20,8 +20,8 @@ function exactlyOne(items, label) {
 }
 await mkdir(output, { recursive: true });
 for (const [artifact, platform, arch, label] of [
-  ['Town-Client-macos-14', 'darwin', 'arm64', 'macos-arm64'],
-  ['Town-Client-windows-latest', 'win32', 'x64', 'windows-x64'],
+  ['portal-desktop-macos-14', 'darwin', 'arm64', 'macos-arm64'],
+  ['portal-desktop-windows-latest', 'win32', 'x64', 'windows-x64'],
 ]) {
   const contents = await files(path.join(input, artifact));
   const metadata = exactlyOne(contents.filter(f => path.basename(f) === 'runtime-bundle.json'), 'runtime manifest');
@@ -47,11 +47,11 @@ with zipfile.ZipFile(sys.argv[1]) as z:
 `, zip, platform], { encoding: 'utf8' }));
   if (archive.manifest !== sha(await readFile(metadata))) throw new Error(`${label} packaged manifest mismatch`);
   if (archive.binary !== bundle.sha256) throw new Error(`${label} engine checksum mismatch`);
-  await copyFile(zip, path.join(output, `Town-Client-${version}-${label}.zip`));
+  await copyFile(zip, path.join(output, `portal-desktop-${version}-${label}.zip`));
   await copyFile(metadata, path.join(output, `runtime-bundle-${label}.json`));
   if (platform === 'win32') {
     const setup = exactlyOne(contents.filter(f => /setup\.exe$/i.test(f)), 'Windows Setup');
-    await copyFile(setup, path.join(output, `Town-Client-${version}-${label}-Setup.exe`));
+    await copyFile(setup, path.join(output, `portal-desktop-${version}-${label}-Setup.exe`));
   }
 }
 const sums = [];

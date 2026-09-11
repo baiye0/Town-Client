@@ -32,7 +32,7 @@ jobs:
     env:
       # Hosted runners do not guarantee an interactive login/session manager.
       # Real launchd lifecycle remains enabled by default for local Mac runs.
-      BEINGS_TEST_BACKGROUND: '0'
+      PORTAL_DESKTOP_TEST_BACKGROUND: '0'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,7 +55,7 @@ jobs:
       - name: Upload platform distributables
         uses: actions/upload-artifact@v4
         with:
-          name: Beings-${{ matrix.os }}
+          name: portal-desktop-${{ matrix.os }}
           path: client/out/make/
           if-no-files-found: error
           retention-days: 14
@@ -84,7 +84,7 @@ jobs:
       run:
         working-directory: client
     env:
-      BEINGS_TEST_BACKGROUND: '1'
+      PORTAL_DESKTOP_TEST_BACKGROUND: '1'
     steps:
       - uses: actions/checkout@v4
         with:

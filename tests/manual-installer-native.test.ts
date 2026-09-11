@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { command, windowsModulePath } from '../desktop/background';
 import { windowsInstallerScript } from '../desktop/manual-installer';
 
-it.skipIf(process.platform !== 'win32' || process.env.TOWN_NATIVE_INSTALLER_TESTS !== '1')('runs the real Windows Setup and automatically launches the installed client', async () => {
+it.skipIf(process.platform !== 'win32' || process.env.PORTAL_DESKTOP_NATIVE_INSTALLER_TESTS !== '1')('runs the real Windows Setup and automatically launches the installed client', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'town-setup-'));
   const make = path.resolve('out/make/squirrel.windows/x64');
   const setups = (await readdir(make)).filter(name => /setup\.exe$/i.test(name));
@@ -15,7 +15,7 @@ it.skipIf(process.platform !== 'win32' || process.env.TOWN_NATIVE_INSTALLER_TEST
   const script = path.join(root, 'install.ps1');
   await writeFile(script, '\ufeff' + windowsInstallerScript(old.pid!, path.join(make, setups[0]), process.execPath));
   const helper = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], {
-    env: { ...process.env, BEINGS_USER_DATA: path.join(root, 'profile') }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(root, 'profile') }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
   });
   let errors = ''; helper.stderr.on('data', chunk => { errors += chunk.toString(); });
   let pid: number | undefined;
@@ -24,8 +24,8 @@ it.skipIf(process.platform !== 'win32' || process.env.TOWN_NATIVE_INSTALLER_TEST
     old.kill();
     expect(await completion, errors).toBe(0);
     const version = (await import('../package.json')).version;
-    const executable = path.join(process.env.LOCALAPPDATA!, 'beings', 'app-' + version, 'beings.exe');
-    const inspect = windowsModulePath + `$p=Get-CimInstance Win32_Process -Filter "Name='beings.exe'" | Where-Object { $_.ExecutablePath -eq '${executable.replaceAll("'", "''")}' -and $_.CommandLine -notmatch '--type=' }; @($p.ProcessId) | ConvertTo-Json -Compress`;
+    const executable = path.join(process.env.LOCALAPPDATA!, 'portal-desktop', 'app-' + version, 'portal-desktop.exe');
+    const inspect = windowsModulePath + `$p=Get-CimInstance Win32_Process -Filter "Name='portal-desktop.exe'" | Where-Object { $_.ExecutablePath -eq '${executable.replaceAll("'", "''")}' -and $_.CommandLine -notmatch '--type=' }; @($p.ProcessId) | ConvertTo-Json -Compress`;
     const deadline = Date.now() + 30_000;
     while (!pid && Date.now() < deadline) {
       const output = await command('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(inspect, 'utf16le').toString('base64')]);

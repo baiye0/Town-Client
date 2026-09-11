@@ -1,10 +1,13 @@
-import { app, BrowserWindow, dialog, ipcMain, net, nativeTheme, protocol, safeStorage, session, shell, Menu } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, net, nativeTheme, nativeImage, protocol, safeStorage, session, shell, Menu, Tray } from 'electron';
+import { clientStartup } from './client-startup';
+import { ClientBrowser } from './browser';
 import path from 'node:path';
 import os from 'node:os';
 import { access, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { SettingsStore } from './settings';
 import { PortalSupervisor } from './portal';
 import { ExternalPortalObserver } from './external-portal';
+import { PortalTakeover } from './portal-takeover';
 import { RuntimeUpdater, loadRuntimeBundle, type RuntimeUpdateResult } from './runtime-update';
 import { UpdateChecker } from './updates';
 import { ClientInstall } from './client-install';
@@ -14,6 +17,7 @@ import { BackgroundPortal } from './background';
 import { KitInstaller } from './kit-install';
 import { ChatProxy } from './proxy';
 import { verifyBeingConnection } from './being-ready';
+import { redact } from './connection';
 import type { SaveSettings, TownPost, TownQuery, KitInstallInput } from './shared';
 import { TownLive } from './town-live';
 import { TownClient, TownCredentials, TOWN_ORIGIN } from './town';
@@ -21,12 +25,18 @@ import { localKits, kitLocation, readKit, importLocalKit } from './kits';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
-declare const TOWN_UPDATE_REPOSITORY: string;
+declare const PORTAL_DESKTOP_UPDATE_REPOSITORY: string;
+declare const PORTAL_DESKTOP_BUILD: string;
+const startedAt = new Date().toISOString();
+const CLIENT_NAME = 'portal-desktop';
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'beings', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
-if (process.env.BEINGS_USER_DATA) app.setPath('userData', path.resolve(process.env.BEINGS_USER_DATA));
-app.setName('Beings');
+app.setName(CLIENT_NAME);
+const userData = process.env.PORTAL_DESKTOP_USER_DATA ? path.resolve(process.env.PORTAL_DESKTOP_USER_DATA) : path.join(app.getPath('appData'), CLIENT_NAME);
+app.setPath('userData', userData);
+app.setPath('sessionData', userData);
 let window: BrowserWindow | null = null;
+let browser: ClientBrowser | undefined;
 let portal: PortalSupervisor;
 let proxy: ChatProxy;
 let store: SettingsStore;
@@ -36,6 +46,10 @@ let townLive: TownLive;
 let updatePoll: ReturnType<typeof setInterval> | undefined;
 let backgroundPoll: ReturnType<typeof setInterval> | undefined;
 let quitting = false;
+let quitCleanupDone = false;
+let sessionEnding = false;
+let tray: Tray | undefined;
+let lifecycleError = '';
 let mutation = Promise.resolve();
 const exclusive = <T>(operation: () => Promise<T>): Promise<T> => {
   const next = mutation.then(operation);
@@ -49,13 +63,20 @@ const chatCSP = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-sr
 async function openExternal(url: string) {
   try {
     const parsed = new URL(url);
-    if (['https:', 'http:'].includes(parsed.protocol) && !parsed.username && !parsed.password) await shell.openExternal(url);
+    if (['https:', 'http:'].includes(parsed.protocol) && !parsed.username && !parsed.password) browser?.open(url);
   } catch { /* Unsupported links stay inside the sandbox. */ }
+}
+function showWindow() {
+  if (quitting) return;
+  if (!window) { if (store) createWindow(); return; }
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
 }
 function createWindow() {
   const acrylic = process.platform === 'win32' && Number(os.release().split('.')[2]) >= 22621;
   window = new BrowserWindow({
-    width: 1280, height: 860, minWidth: 920, minHeight: 640, title: 'Beings',
+    width: 1280, height: 860, minWidth: 920, minHeight: 640, title: CLIENT_NAME,
     icon: path.join(app.isPackaged ? process.resourcesPath : app.getAppPath(), app.isPackaged ? 'branding/app.png' : 'resources/branding/app.png'),
     backgroundColor: process.platform === 'darwin' || acrylic ? '#00000000' : nativeTheme.shouldUseDarkColors ? '#212121' : '#ffffff',
     ...(process.platform === 'darwin' ? { vibrancy: 'sidebar' as const, visualEffectState: 'active' as const } : {}),
@@ -73,7 +94,16 @@ function createWindow() {
     const chatDocument = parsed.protocol === 'beings:' && parsed.hostname === 'chat' && parsed.pathname === '/';
     if (!chatDocument && url !== shellURL()) { event.preventDefault(); void openExternal(url); }
   });
-  window.on('closed', () => { window = null; });
+  const created = window;
+  browser = new ClientBrowser(created, state => { if (!created.isDestroyed() && !created.webContents.isDestroyed()) created.webContents.send('beings:browser-state', state); });
+  created.on('close', event => {
+    if (quitting || sessionEnding) return;
+    event.preventDefault();
+    created.hide();
+  });
+  // Let Windows logoff/shutdown close the app rather than hide the window.
+  created.on('query-session-end', () => { sessionEnding = true; });
+  created.on('closed', () => { if (window === created) window = null; });
   void window.loadURL(shellURL());
 }
 
@@ -133,12 +163,44 @@ async function ready() {
     ipcMain.handle(channel, (event, ...args) => {
       const frame = event.senderFrame;
       if (!window || event.sender !== window.webContents || frame !== window.webContents.mainFrame || frame.url !== shellURL()) throw new Error('Untrusted IPC sender');
+      if (quitting && !['beings:browser-bounds', 'beings:diagnostics'].includes(channel)) throw new Error('客户端正在退出，请稍候。');
       if (recoveryBlocked && ['beings:save', 'beings:portal-start', 'beings:portal-stop', 'beings:kits-apply'].includes(channel)) throw new Error('Portal 升级恢复尚未完成，请重新启动客户端完成恢复。');
       return callback(...args);
     });
   };
+  handle('beings:client-startup', (enabled?: boolean) => clientStartup(app, process.platform, process.execPath, enabled));
+  handle('beings:quit', () => { setImmediate(() => app.quit()); });
+  handle('beings:browser-state', () => browser?.state);
+  handle('beings:browser-open', (url?: string) => browser?.open(url));
+  handle('beings:browser-action', (action: import('./shared').BrowserAction) => browser?.action(action));
+  handle('beings:browser-bounds', (bounds: import('./shared').BrowserBounds) => browser?.setBounds(bounds));
+  const diagnose = async (): Promise<import('./shared').DiagnosticReport> => {
+    const connection = store.connection;
+    const checks: import('./shared').DiagnosticReport['checks'] = [];
+    checks.push({ name: '客户端', status: 'ok', detail: `主进程 ${process.pid} · 关闭窗口保留运行，退出客户端结束进程` });
+    if (lifecycleError) checks.push({ name: '上次退出', status: 'error', detail: lifecycleError });
+    checks.push({ name: '凭据保护', status: secretStorage.isEncryptionAvailable() ? 'ok' : 'error', detail: secretStorage.isEncryptionAvailable() ? '系统密钥库可用' : '系统密钥库不可用' });
+    try { await access(store.settings.workspace); checks.push({ name: '工作目录', status: 'ok', detail: '目录可访问' }); }
+    catch { checks.push({ name: '工作目录', status: 'warning', detail: '目录尚未创建或不可访问' }); }
+    try { await verifyBeingConnection(connection, net.fetch.bind(net) as typeof fetch); checks.push({ name: 'Being', status: 'ok', detail: '现有状态接口可访问；未发送消息或调用工具' }); }
+    catch (error) { checks.push({ name: 'Being', status: 'warning', detail: String((error as Error).message).replace(/，Portal 未启动。/g, '。') }); }
+    if (connection !== store.connection) throw new Error('连接已切换，请重新检查。');
+    checks.push({ name: 'Portal', status: portal.state.phase === 'connected' ? 'ok' : portal.state.phase === 'error' ? 'error' : 'warning', detail: portal.state.message });
+    checks.push({ name: 'Town', status: townLive.state.phase === 'connected' ? 'ok' : 'warning', detail: townLive.state.message });
+    return { version: app.getVersion(), build: PORTAL_DESKTOP_BUILD, platform: `${process.platform}/${process.arch}`, pid: process.pid, startedAt, checkedAt: new Date().toISOString(), checks,
+      logs: portal.state.logs.slice(-60).map(line => redact(line, [connection?.token || '', connection?.relaySecret || '']).replaceAll(os.homedir(), '~')) };
+  };
+  handle('beings:diagnostics', diagnose);
+  handle('beings:diagnostics-export', async () => {
+    const report = await diagnose();
+    const result = await dialog.showSaveDialog(window!, { title: '导出诊断', defaultPath: `${CLIENT_NAME}-diagnostics-${new Date().toISOString().slice(0,10)}.json`, filters: [{ name: 'JSON', extensions: ['json'] }] });
+    if (result.canceled || !result.filePath) return false;
+    // Export status only: engine output can contain user task data even when credentials are redacted.
+    await writeFile(result.filePath, JSON.stringify({ ...report, logs: undefined }, null, 2), { mode: 0o600 });
+    return true;
+  });
   let runtimeUpdate: RuntimeUpdateResult = { phase: 'current', message: 'Portal 升级状态将在启动检查后显示。' };
-  const updates = new UpdateChecker(app.getVersion(), TOWN_UPDATE_REPOSITORY, net.fetch.bind(net) as typeof fetch,
+  const updates = new UpdateChecker(app.getVersion(), PORTAL_DESKTOP_UPDATE_REPOSITORY, net.fetch.bind(net) as typeof fetch,
     state => { if (window && !window.isDestroyed()) window.webContents.send('beings:update-state', state); });
   let showingUpdates = false;
   const showUpdates = async () => {
@@ -147,16 +209,16 @@ async function ready() {
     try {
       const state = await updates.check();
       const answer = await dialog.showMessageBox(window, { type: state.phase === 'available' ? 'info' : 'none', title: '客户端更新',
-        message: state.phase === 'available' ? `发现 Town-Client ${state.latestVersion}` : state.message,
+        message: state.phase === 'available' ? `发现 ${CLIENT_NAME} ${state.latestVersion}` : state.message,
         detail: `当前客户端：${app.getVersion()}${runtimeUpdate.portalVersion ? ` · Portal：${runtimeUpdate.portalVersion}` : ''}\n${runtimeUpdate.message}\n\n下载并校验安装包后，先停止旧 Portal 和对应守护，再安装客户端。安装完成自动打开新版，沿用原配置启动最新 Portal。请先完成本机任务并保存草稿。`,
         buttons: state.phase === 'available' && app.isPackaged ? ['稍后', '下载并升级', '打开发布页'] : ['关闭', '打开发布页'], defaultId: 0, cancelId: 0 });
       if (state.phase === 'available' && app.isPackaged && answer.response === 1) {
         window?.setProgressBar(2);
         let handoff: () => Promise<void>;
-        try { handoff = await stageInstaller(directory, state.latestVersion!, TOWN_UPDATE_REPOSITORY, process.execPath, net.fetch.bind(net) as typeof fetch); }
+        try { handoff = await stageInstaller(directory, state.latestVersion!, PORTAL_DESKTOP_UPDATE_REPOSITORY, process.execPath, net.fetch.bind(net) as typeof fetch); }
         finally { window?.setProgressBar(-1); }
         if (!window || quitting) return;
-        const confirmed = await dialog.showMessageBox(window, { type: 'info', title: '安装包已就绪', message: `安装 Town-Client ${state.latestVersion}`, detail: '已完成下载和校验。继续将停止 Portal 及守护、关闭客户端，安装成功后自动打开新版并恢复运行。执行中的本机任务会中断，请先保存草稿。', buttons: ['稍后', '停止 Portal 并安装'], defaultId: 0, cancelId: 0 });
+        const confirmed = await dialog.showMessageBox(window, { type: 'info', title: '安装包已就绪', message: `安装 ${CLIENT_NAME} ${state.latestVersion}`, detail: '已完成下载和校验。继续将停止 Portal 及守护、关闭客户端，安装成功后自动打开新版并恢复运行。执行中的本机任务会中断，请先保存草稿。', buttons: ['稍后', '停止 Portal 并安装'], defaultId: 0, cancelId: 0 });
         if (confirmed.response !== 1) return;
         await exclusive(async () => {
           if (recoveryBlocked) throw new Error('请先完成上次升级恢复。');
@@ -186,17 +248,76 @@ async function ready() {
     startupNotice = undefined;
   };
   const externalPortal = new ExternalPortalObserver();
+  const ownedRoot = () => background.installedService?.label === background.label && !background.installedService.existing ? background.installedService.root : undefined;
   const observeExternal = async () => {
-    const state = await externalPortal.read(store.connection);
+    const state = await externalPortal.read(store.connection, background.installedService?.root);
     if (!state) return false;
     portal.state = state; portal.emit('state', state); return true;
   };
   const publishBackground = async () => {
     const state = await background.portalState();
+    if (takeover.holdMessage) {
+      startupNotice = takeover.holdMessage;
+      portal.state = { ...state, phase: 'error', managed: false, message: takeover.holdMessage };
+      portal.emit('state', portal.state); return;
+    }
     if (!background.state.running && await observeExternal()) return;
     portal.state = state;
     portal.emit('state', portal.state);
   };
+  const takeover = new PortalTakeover(directory, {
+    discover: connection => externalPortal.conflicts(connection, ownedRoot()),
+    preflight: async () => {
+      await verifyConnection();
+      if (app.isPackaged) await loadRuntimeBundle(process.resourcesPath);
+      else await access(binary);
+    },
+    confirm: async targets => {
+      if (!window || quitting) return false;
+      const review = await dialog.showMessageBox(window, { type: 'question', title: '切换到客户端 Portal',
+        message: `检测到 ${store.settings.being} 的旧 Portal，是否关闭并使用客户端版本？`,
+        detail: targets.map(item => `${item.label}${item.pid ? ` · PID ${item.pid}` : ''}\n${item.root}`).join('\n\n') +
+          `\n\n确认后会先停用以上旧服务的自启和守护，确认进程退出，再用当前客户端附带的 Portal 和本机设置启动。旧配置和工作文件保留，正在执行的工具任务会被中断。\n工作目录：${store.settings.workspace}\n取消或切换失败时暂停，不会反复弹窗或自动切回旧服务。`,
+        buttons: ['取消', '关闭旧服务并启动客户端 Portal'], defaultId: 1, cancelId: 0, noLink: true });
+      return review.response === 1;
+    },
+    stop: async target => { await background.unload(target.service!); },
+  });
+  const startClientPortal = async (replacing = false, restart = false) => {
+    if (!store.connection) throw new Error('请先连接 Being。');
+    if (restart) {
+      await portal.stop();
+      if (!store.settings.backgroundEnabled && background.state.enabled) await background.disable();
+    }
+    if (replacing) {
+      const selected = app.isPackaged ? (await loadRuntimeBundle(process.resourcesPath)).binary : binary;
+      await portal.stop();
+      if (background.installedService && (!ownedRoot())) await background.forget();
+      await store.save({ ...store.settings, portalBinary: selected });
+    }
+    if (store.settings.backgroundEnabled) {
+      await portal.stop();
+      try {
+        await background.enable(store.settings, store.connection);
+        if (replacing) await new RuntimeUpdater(directory, background).waitReady(background.installedService!);
+      } catch (error) {
+        // A failed takeover stays stopped; never resurrect the old supervisor.
+        if (replacing) await background.disable();
+        throw error;
+      }
+      await publishBackground();
+    } else await portal.start(store.settings, store.connection);
+  };
+  const publishCurrentPortal = async () => { if (takeover.holdMessage || !portal.managing) await publishBackground(); };
+  handle('beings:connection-defaults', async (input: Pick<SaveSettings, 'connectionLink'>) => {
+    const connection = store.resolveConnection(input);
+    if (connection.endpoint === store.connection?.endpoint && background.installedService) {
+      return { portalName: store.settings.portalName, source: '当前本机配置' };
+    }
+    const targets = await externalPortal.conflicts(connection, ownedRoot());
+    const previous = targets.find(item => item.service?.name);
+    return { portalName: previous?.service?.name || store.settings.portalName, source: previous?.root };
+  });
   // Initial reads wait for configuration validation and upgrade recovery.
   handle('beings:snapshot', () => exclusive(async () => snapshot()));
   handle('beings:appearance', (theme?: 'light' | 'dark') => exclusive(async () => {
@@ -238,7 +359,7 @@ async function ready() {
   handle('beings:town-token', (token: string) => exclusive(async () => { await townCredentials.save(token); townWarning = undefined; townLive.restart(); }));
   handle('beings:town-open', async (route: string) => {
     if (typeof route !== 'string' || !/^\/(?:api\/(?:[a-z]+\/help|grove\/[a-zA-Z0-9_-]+\/download)|embers)?$/.test(route)) throw new Error('不支持的 Town 链接。');
-    await shell.openExternal(TOWN_ORIGIN + route);
+    browser?.open(TOWN_ORIGIN + route);
   });
   handle('beings:kits', () => localKits(store.settings));
   handle('beings:kit-prepare', (id: string) => exclusive(async () => {
@@ -277,17 +398,12 @@ async function ready() {
     return { installed: true, name: installed.name };
   }));
   handle('beings:save', (input: SaveSettings) => exclusive(async () => {
-    if (!background.state.enabled && !input.backgroundEnabled && !['stopped', 'error', 'external'].includes(portal.state.phase)) throw new Error('请先停止客户端管理的 Portal，再修改连接或本机设置。');
-    if (portal.state.managed === false && input.backgroundEnabled) throw new Error('当前已有独立 Portal 运行。请使用原管理方式管理后台服务，避免启动重复实例。');
     const previous = { ...store.settings }; const previousConnection = store.connection;
     await store.save(input);
     try {
-      if (store.settings.backgroundEnabled) {
-        await verifyConnection();
-        await portal.stop();
-        await background.enable(store.settings, store.connection!);
-        await publishBackground();
-      } else if (background.state.enabled) { await background.disable(); await publishBackground(); }
+      await verifyConnection();
+      await takeover.run(store.connection!, 'manual', replacing => startClientPortal(replacing, true));
+      await publishCurrentPortal();
     } catch (error) {
       if (previousConnection) await store.save({ ...previous, connectionLink: previousConnection.link + '&relay_secret=' + encodeURIComponent(previousConnection.relaySecret) });
       throw error;
@@ -303,16 +419,14 @@ async function ready() {
   });
   handle('beings:portal-start', () => exclusive(async () => {
     if (startupDeferred) {
-      await restoreStartup();
+      await restoreStartup('manual');
       if (startupDeferred) throw new Error(startupNotice);
+      return portal.state;
     }
-    if (!portal.managing && await observeExternal()) return portal.state;
     if (!store.connection) throw new Error('请先连接 Being。');
     await verifyConnection();
-    if (store.settings.backgroundEnabled) {
-      await background.enable(store.settings, store.connection); await publishBackground(); return portal.state;
-    }
-    return portal.start(store.settings, store.connection);
+    await takeover.run(store.connection, 'manual', startClientPortal);
+    await publishCurrentPortal(); return portal.state;
   }));
   handle('beings:portal-stop', () => exclusive(async () => {
     if (portal.state.managed === false) throw new Error('当前 Portal 由外部管理，请使用原管理方式停止。');
@@ -327,13 +441,45 @@ async function ready() {
     if (!store.connection) throw new Error('请先保存工作目录。');
     const error = await shell.openPath(store.settings.workspace); if (error) throw new Error(error);
   });
-  portal.on('state', state => { if (window && !window.isDestroyed()) window.webContents.send('beings:portal-state', state); });
+  handle('beings:open-loom', () => exclusive(async () => {
+    if (!store.connection) throw new Error('请先配置 Being 链接，再打开原版 Loom。');
+    browser?.open(store.connection.link);
+  }));
+  let handlingConflict = false;
+  portal.on('state', state => {
+    if (window && !window.isDestroyed()) window.webContents.send('beings:portal-state', state);
+    // A competing service can start between discovery and launch. Resolve that
+    // race once through the same confirmation path, never from a retry timer.
+    if (state.conflict && !handlingConflict && !takeover.holdMessage && !quitting) {
+      handlingConflict = true;
+      void exclusive(async () => {
+        if (background.state.enabled && !background.state.running) await background.disable();
+        if (store.connection) await takeover.run(store.connection, 'automatic', startClientPortal, true);
+        await publishBackground();
+      }).catch(error => {
+        portal.state = { phase: 'error', managed: false, message: takeover.holdMessage || String(error), logs: [] };
+        portal.emit('state', portal.state);
+      }).finally(() => { handlingConflict = false; });
+    }
+  });
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const }] : []),
+    { label: '客户端', submenu: [{ label: '显示主窗口', click: showWindow }, { label: '退出客户端', click: () => app.quit() }] },
     { role: 'editMenu' }, { label: '视图', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     { role: 'windowMenu' }, { label: '帮助', submenu: [{ label: '检查更新…', click: () => { void showUpdates(); } }] },
   ]));
-  async function restoreStartup() {
+  const trayIcon = nativeImage.createFromPath(path.join(app.isPackaged ? process.resourcesPath : app.getAppPath(),
+    app.isPackaged ? 'branding/app.png' : 'resources/branding/app.png'));
+  tray = new Tray(trayIcon.resize({ width: process.platform === 'darwin' ? 18 : 24, height: process.platform === 'darwin' ? 18 : 24 }));
+  tray.setToolTip(CLIENT_NAME);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示主窗口', click: showWindow },
+    { type: 'separator' },
+    { label: '退出客户端', click: () => app.quit() },
+  ]));
+  tray.on('click', showWindow);
+  tray.on('double-click', showWindow);
+  async function restoreStartup(intent: 'manual' | 'automatic' = 'automatic') {
     if (!store.connection) return;
     try { await verifyConnection(); startupDeferred = false; }
     catch (error) {
@@ -345,53 +491,59 @@ async function ready() {
       return;
     }
     try {
-      if (installIntent && app.getVersion() === installIntent.from) {
-        await clientInstall.resume(installIntent);
-        if (installIntent.foreground) await portal.start(store.settings, store.connection);
-        else await publishBackground();
-        runtimeUpdate = { phase: 'error', message: '客户端安装未完成，已恢复安装前的 Portal。' };
-        return;
-      }
-      const updater = new RuntimeUpdater(directory, background, process.platform, undefined, undefined,
-        async (connection, exclude) => {
-          const saved = installIntent?.services.map(s => s.service).filter(s => s.kind === 'portable') || [];
-          const live = await externalPortal.forUpgrade(connection, background.label, exclude);
-          return [...saved, ...live.filter(s => !saved.some(old => old.root === s.root))];
-        });
-      const recovered = await updater.recover();
-      if (recovered) {
-        runtimeUpdate = { phase: 'error', message: '已恢复上次未完成升级前的 Portal；本次启动不再自动重试升级。' };
-        await publishBackground();
-        return;
-      }
-      if (app.isPackaged) {
-        const { bundle, binary: bundledBinary } = await loadRuntimeBundle(process.resourcesPath);
-        runtimeUpdate = await updater.sync(bundledBinary, bundle, store.settings, store.connection);
-        if (runtimeUpdate.phase !== 'skipped') {
-          if (runtimeUpdate.phase === 'current' || runtimeUpdate.phase === 'updated') {
-            const service = background.installedService!;
-            if (installIntent && runtimeUpdate.phase === 'current') await background.load(service);
-            await store.save({ ...store.settings, portalBinary: path.join(service.root, process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'), portalConfigPath: service.configPath, workspace: service.cwd || store.settings.workspace, portalEnvironmentPath: service.environment?.PATH || store.settings.portalEnvironmentPath, portalName: service.name || store.settings.portalName });
-            if (installIntent) await clientInstall.finish();
-          }
+      const connection = store.connection;
+      await takeover.run(connection, intent, async replacing => {
+        if (replacing) { await startClientPortal(true); return; }
+        if (installIntent && app.getVersion() === installIntent.from) {
+          await clientInstall.resume(installIntent);
+          if (installIntent.foreground) await portal.start(store.settings, connection);
+          else await publishBackground();
+          runtimeUpdate = { phase: 'error', message: '客户端安装未完成，已恢复安装前的 Portal。' };
+          return;
+        }
+        const updater = new RuntimeUpdater(directory, background, process.platform, undefined, undefined,
+          async () => {
+            const saved = installIntent?.services.map(s => s.service).filter(s => s.kind === 'portable') || [];
+            // New external services must go through the confirmation above.
+            // Saved install targets were already reviewed before installation.
+            return saved;
+          });
+        const recovered = await updater.recover();
+        if (recovered) {
+          runtimeUpdate = { phase: 'error', message: '已恢复上次未完成升级前的 Portal；本次启动不再自动重试升级。' };
           await publishBackground();
-          // The completed upgrade owns and starts the replacement service.
           return;
         }
-        if (await observeExternal()) {
-          runtimeUpdate = { phase: 'skipped', message: '发现未能确认管理方式的独立 Portal，未改动其进程和文件。请先迁入客户端管理。' };
-          return;
+        if (app.isPackaged) {
+          const { bundle, binary: bundledBinary } = await loadRuntimeBundle(process.resourcesPath);
+          runtimeUpdate = await updater.sync(bundledBinary, bundle, store.settings, connection);
+          if (runtimeUpdate.phase !== 'skipped') {
+            if (runtimeUpdate.phase === 'current' || runtimeUpdate.phase === 'updated') {
+              const service = background.installedService!;
+              if (installIntent && runtimeUpdate.phase === 'current') await background.load(service);
+              await store.save({ ...store.settings, portalBinary: path.join(service.root, process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal'), portalConfigPath: service.configPath, workspace: service.cwd || store.settings.workspace, portalEnvironmentPath: service.environment?.PATH || store.settings.portalEnvironmentPath, portalName: service.name || store.settings.portalName });
+              if (installIntent) await clientInstall.finish();
+            }
+            await publishBackground();
+            // The completed upgrade owns and starts the replacement service.
+            return;
+          }
+          if (await observeExternal()) {
+            runtimeUpdate = { phase: 'skipped', message: '发现未能确认管理方式的独立 Portal，未改动其进程和文件。请先迁入客户端管理。' };
+            return;
+          }
+          await store.save({ ...store.settings, portalBinary: bundledBinary });
+          runtimeUpdate = { phase: 'current', message: '已选择随客户端附带的 Portal，下次启动按原配置运行。', portalVersion: bundle.portalVersion };
         }
-        await store.save({ ...store.settings, portalBinary: bundledBinary });
-        runtimeUpdate = { phase: 'current', message: '已选择随客户端附带的 Portal，下次启动按原配置运行。', portalVersion: bundle.portalVersion };
-      }
-      if (installIntent || store.settings.backgroundEnabled || store.settings.autoStart) {
-        if (await observeExternal()) { /* Only identity-verified supervision is migrated. */ }
-        else if (installIntent || store.settings.backgroundEnabled) {
-          await background.enable(store.settings, store.connection); await publishBackground();
-        } else await portal.start(store.settings, store.connection);
-      }
-      if (installIntent) await clientInstall.finish();
+        if (installIntent || store.settings.backgroundEnabled || store.settings.autoStart) {
+          if (await observeExternal()) { /* Only identity-verified supervision is migrated. */ }
+          else if (installIntent || store.settings.backgroundEnabled) {
+            await background.enable(store.settings, connection); await publishBackground();
+          } else await portal.start(store.settings, connection);
+        }
+        if (installIntent) await clientInstall.finish();
+      });
+      await publishCurrentPortal();
     } catch (error) {
       recoveryBlocked = await access(path.join(directory, 'runtime-update.json')).then(() => true, () => false);
       runtimeUpdate = { phase: 'error', message: String(error) };
@@ -401,8 +553,8 @@ async function ready() {
     }
   }
   createWindow();
-  await exclusive(restoreStartup);
-  if (app.isPackaged && !process.env.BEINGS_USER_DATA) {
+  await exclusive(() => restoreStartup());
+  if (app.isPackaged && !process.env.PORTAL_DESKTOP_USER_DATA) {
     void updates.check();
     updatePoll = setInterval(() => { void updates.check(); }, 6 * 60 * 60 * 1000);
     updatePoll.unref();
@@ -422,16 +574,25 @@ const squirrelEvent = process.platform === 'win32' ? installerEvent(process.argv
 if (squirrelEvent) { void handleInstallerEvent(squirrelEvent, process.execPath).catch(() => { process.exitCode = 1; }).finally(() => app.quit()); }
 else if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on('second-instance', () => { window?.restore(); window?.focus(); });
-  app.whenReady().then(ready).catch(error => { dialog.showErrorBox('Beings 启动失败', String(error)); app.quit(); });
-  app.on('activate', () => { if (!window && store) createWindow(); });
-  app.on('window-all-closed', () => app.quit());
+  app.on('second-instance', showWindow);
+  app.whenReady().then(ready).catch(error => { dialog.showErrorBox(`${CLIENT_NAME} 启动失败`, String(error)); app.quit(); });
+  app.on('activate', showWindow);
+  app.on('window-all-closed', () => { /* Explicit quit owns process cleanup. */ });
   app.on('before-quit', event => {
-    if (quitting || !portal) return;
-    event.preventDefault(); quitting = true;
-    clearInterval(backgroundPoll); clearInterval(updatePoll);
-    townLive?.dispose();
-    proxy.abortAll();
-    void exclusive(async () => { await kitInstaller.dispose(); await portal.stop(); }).finally(() => app.quit());
+    if (quitCleanupDone || sessionEnding || !portal) return;
+    event.preventDefault();
+    if (quitting) return;
+    quitting = true;
+    lifecycleError = '';
+    void exclusive(async () => { await kitInstaller?.dispose(); await portal.stop(); browser?.close(); }).then(() => {
+      clearInterval(backgroundPoll); clearInterval(updatePoll);
+      townLive?.dispose(); proxy.abortAll();
+      quitCleanupDone = true; tray?.destroy(); app.quit();
+    }).catch(() => {
+      quitting = false;
+      lifecycleError = '退出未完成，当前客户端保持打开。请在本机连接中检查 Portal 状态，停止后再退出。';
+      showWindow();
+      if (window && !window.isDestroyed()) void dialog.showMessageBox(window, { type: 'error', title: '退出未完成', message: lifecycleError, buttons: ['知道了'] }).catch(() => {});
+    });
   });
 }

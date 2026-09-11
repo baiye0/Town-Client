@@ -15,7 +15,7 @@ export function townRoute(query: TownQuery, beingId = ''): { route: string; priv
     case 'firesides': return { route: '/api/fireside/list', private: true };
     case 'fireside': {
       if (typeof query.id !== 'string' || !/^\d{1,16}$/.test(query.id)) throw new Error('无效的围炉编号。');
-      return { route: `/api/fireside/hear?fireside_id=${query.id}`, private: true };
+      return { route: `/api/fireside/hear?fireside_id=${query.id}&limit=50`, private: true };
     }
     case 'inbox': return { route: '/api/messages?with=received', private: true };
     case 'sent': return { route: '/api/messages?with=sent', private: true };
@@ -91,14 +91,19 @@ export class TownClient {
     const limit = input.kind === 'bonfire' ? 4000 : 32000;
     if ([...input.content].length > limit) throw new Error(`内容不能超过 ${limit} 字。`);
     let route: string, body: Record<string, unknown>;
+    if (input.replyTo !== undefined) {
+      if (input.kind === 'dm' ? typeof input.replyTo !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(input.replyTo) : typeof input.replyTo !== 'number' || !Number.isSafeInteger(input.replyTo) || input.replyTo < 1) throw new Error('回复目标无效，请重新选择消息。');
+    }
     if (input.kind === 'bonfire') { route = '/api/bonfire/speak'; body = { message: input.content }; }
     else if (input.kind === 'dm') {
       if (typeof input.recipient !== 'string' || !input.recipient.trim() || input.recipient.length > 160) throw new Error('请输入收件 Being 的 ID 或显示名。');
+      if (input.recipient.trim() === this.getBeingId()) throw new Error('不能给当前 Being 自己发送私信，请选择其他收件人。');
       route = '/api/messages'; body = { recipient: input.recipient.trim(), content: input.content };
     } else if (input.kind === 'fireside') {
       if (typeof input.firesideId !== 'string' || !/^\d{1,16}$/.test(input.firesideId) || !Number.isSafeInteger(Number(input.firesideId)) || Number(input.firesideId) < 1) throw new Error('请选择有效的围炉。');
       route = '/api/fireside/speak'; body = { fireside_id: Number(input.firesideId), message: input.content };
     } else throw new Error('不支持的发送请求。');
+    if (input.replyTo !== undefined) body.reply_to = input.replyTo;
     try {
       const response = await this.fetcher(this.origin + route, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body), credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(20000) });
       if (!response.ok) return await townError(response, token);
