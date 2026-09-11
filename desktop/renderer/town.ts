@@ -373,7 +373,7 @@ export class TownViews {
     if (this.tab === 'services') {
       const routes: Record<string, [string, string, string]> = {
         grove: ['◇', 'Grove 工具市集', 'kits'], bonfire: ['♧', '篝火', 'bonfire'], fireside: ['◎', '围炉', 'firesides'], messages: ['✉', '私信', 'mail'],
-        ember: ['▤', '书架', 'embers'], scroll: ['≡', '卷轴', 'scrolls'], beings: ['◎', '居民目录', 'residents'], portal: ['⌘', '本机 Portal', 'portal'],
+        ember: ['▤', '书架', 'embers'], scroll: ['≡', '卷轴', 'scrolls'], beings: ['◎', '居民目录', 'residents'], portal: ['⌘', 'Portal 设置', 'portal'],
       };
       for (const [name, raw] of services) {
         const service = record(raw), key = name.split(' ').at(-1)!;

@@ -590,7 +590,7 @@ else {
       quitCleanupDone = true; tray?.destroy(); app.quit();
     }).catch(() => {
       quitting = false;
-      lifecycleError = '退出未完成，当前客户端保持打开。请在本机连接中检查 Portal 状态，停止后再退出。';
+      lifecycleError = '退出未完成，当前客户端保持打开。请在 Portal 设置中检查运行状态，停止后再退出。';
       showWindow();
       if (window && !window.isDestroyed()) void dialog.showMessageBox(window, { type: 'error', title: '退出未完成', message: lifecycleError, buttons: ['知道了'] }).catch(() => {});
     });

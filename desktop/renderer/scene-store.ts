@@ -11,7 +11,7 @@ export interface SceneEnvelope {
   schema: 'being.environment/v1'; messageId: string; source: { channel: 'portal-desktop'; instanceId: string };
   audience: string; capturedAt: string; environment: SceneObservation; delivery: 'local-only';
 }
-const titles: Record<SceneView, string> = { chat: '与你的 Being 交谈', town: '小镇广场', bonfire: '篝火', firesides: '围炉', mail: '私信', embers: '书架', scrolls: '卷轴', kits: '工具间', portal: '本机空间' };
+const titles: Record<SceneView, string> = { chat: '与你的 Being 交谈', town: '小镇广场', bonfire: '篝火', firesides: '围炉', mail: '私信', embers: '书架', scrolls: '卷轴', kits: '工具间', portal: 'Portal 设置' };
 export class SceneStore extends EventTarget {
   readonly instanceId = crypto.randomUUID();
   current: SceneObservation = { sceneId: 'desktop:chat:unconnected', view: 'chat', title: titles.chat, identity: '', revision: 1, observedAt: new Date().toISOString(), status: 'loading', scope: '尚未连接', filters: {} };

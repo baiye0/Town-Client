@@ -73,7 +73,7 @@ function setView(view: string, resourceId?: string) {
   const sheet = $<HTMLDialogElement>('place-sheet');
   if (view === 'chat') { if (sheet.open) sheet.close(); }
   else if (!sheet.open) sheet.showModal();
-  const titles: Record<string, string> = { chat: '对话', portal: '本机 Portal', town: '小镇广场', bonfire: '篝火', firesides: '围炉', mail: '私信', embers: '书架', scrolls: '卷轴', kits: 'Kit 工具库' };
+  const titles: Record<string, string> = { chat: '对话', portal: 'Portal 设置', town: '小镇广场', bonfire: '篝火', firesides: '围炉', mail: '私信', embers: '书架', scrolls: '卷轴', kits: 'Kit 工具库' };
   $('view-title').textContent = titles[view] || '对话';
   $('town-view').hidden = ['chat', 'portal'].includes(view);
   townViews.show(view, resourceId);
