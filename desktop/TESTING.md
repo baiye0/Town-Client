@@ -24,7 +24,7 @@
 
 ## CI 接入
 
-`.github/workflows/desktop-tests.yml` 在 push、pull request 和手动运行时执行 macOS/Windows 矩阵，构建并运行客户端和引擎测试，通过后执行 `npm run make` 并上传平台分发包。Portal 源码与客户端位于同一仓库，由同一次提交记录，无需跨仓库 checkout 权限。
+`.github/workflows/desktop-tests.yml` 在 push、pull request 和手动运行时执行 macOS/Windows 矩阵，构建并运行客户端和引擎测试，只上传测试报告。`npm run make` 和发布安装包由版本 tag 的 release 工作流负责。Portal 子仓与客户端通过同一次父仓提交记录配套版本。
 
 托管 runner 设置 `PORTAL_DESKTOP_TEST_BACKGROUND=0`，报告中显示 **SKIPPED**；普通 Portal 子进程、真实 Relay/工具调用及 Rust 测试仍执行。不能把这个结果当成登录自启验收。
 

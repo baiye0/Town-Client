@@ -7,7 +7,7 @@
 | 环境 | 前置条件 | 当前交付状态 |
 | --- | --- | --- |
 | macOS | Git、Node.js 22.12+、npm、Rust stable、Xcode Command Line Tools | 已在 Apple Silicon 本机构建 `.app` / ZIP 并运行；Intel 需对应 x64 机器另行构建 |
-| Windows | Git、Node.js 22.12+、npm、Rust stable MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK | 配置了 ZIP / Squirrel Setup；Windows 原生构建、安装和后台任务仍需实机验收 |
+| Windows | Git、Node.js 22.12+、npm、Rust stable MSVC 工具链、Visual Studio C++ Build Tools 和 Windows SDK | Forge 构建应用和 ZIP，electron-builder / NSIS 提供安装向导 |
 | Linux | Git、Node.js 22.12+、npm、Rust stable、本机 C/C++ 链接工具及 Electron 桌面运行依赖、密钥库 | 配置了 ZIP；后台常驻未实现，未完成 Linux 桌面验收 |
 
 这些是源码构建条件。使用已打包客户端进行聊天、运行内置 Portal 不需要另装 Node 或 Rust。特定 Kit 可能另需 Node/Python、账号凭据或外部 CLI，安装窗口会说明依赖。
@@ -70,7 +70,7 @@ npm run make
 | package / Windows | `out/Portal Desktop-win32-<arch>/portal-desktop.exe`，必须连同所在目录的其他文件使用 |
 | package / Linux | `out/Portal Desktop-linux-<arch>/portal-desktop`，必须连同所在目录的其他文件使用 |
 | make / ZIP | `out/make/zip/<platform>/<arch>/Portal Desktop-<platform>-<arch>-<version>.zip` |
-| make / Windows Setup | `out/make/squirrel.windows/<arch>/Portal Desktop-<version> Setup.exe`，同目录另有 `RELEASES` 和 `portal-desktop-<version>-full.nupkg` |
+| make / Windows Setup | `out/make/nsis/x64/portal-desktop-<version>-windows-x64-Setup.exe` |
 
 ZIP 含完整应用目录和内置 Portal。不要只拷贝 Windows 的单个 exe 或 macOS `.app` 中的单个可执行文件。当前没有 DMG、MSI、AppImage、deb/rpm。版本标签触发 macOS / Windows 配套构建，全部验证通过后才发布 GitHub Release。
 
@@ -78,7 +78,7 @@ macOS 可将解压后的 `Portal Desktop.app` 放到 Applications 或稳定的�
 
 ### Windows 安装包的明确边界
 
-客户端已处理 Squirrel 安装、更新和卸载事件，由安装程序创建或移除快捷方式；这些短进程不会启动 Portal。Windows Setup 升级及后台任务仍需实机验收。
+Windows 使用 electron-builder 的 NSIS 安装向导，提供目录选择、进度和完成页。安装前确认关闭运行中的客户端及 Portal，沿用安装恢复记录，完成页只启动一次客户端。应用内升级通过 `/S /D=<当前目录>` 保持安装位置，由升级助手启动一次新版；用户配置独立存储，卸载不删除配置。普通 CI 只测试，推送匹配客户端版本的 `v*` tag 才生成并发布 Windows/macOS 安装包。
 
 当前未配置 macOS Developer ID、公证或 Windows Authenticode。客户端支持用户主动下载并安装更新。操作系统可能提示来源未验证；正式公开发布前应配置签名并在目标系统验收。Electron 的下载校验不等于应用代码签名。
 
@@ -126,6 +126,6 @@ npm run make
 
 静态类型检查：`npm run typecheck`。完整测试及覆盖边界见 [TESTING.md](TESTING.md)。`npm run test:all` 会构建 package，但本地不会顺带生成 make 分发包；发布前还需执行 `npm run make`。
 
-Push / PR 的 GitHub Actions 在 macOS 和 Windows 运行测试，通过后执行 make，并上传分发包和测试报告（保存 14 天）。上传 artifact 不会创建 Release 或安装到用户机器。托管 runner 跳过真实登录服务测试；可通过手动 `native_background` job 使用专用已登录 Mac runner。Windows 原生后台任务、睡眠唤醒以及其他平台仍需实机验收。
+Push / PR 的 GitHub Actions 在 macOS 和 Windows 运行测试，只上传测试报告（保存 14 天）。仅推送与客户端版本一致的 `v*` tag 才执行 make，双平台验证通过后一起发布。托管 runner 跳过真实 macOS 登录服务测试；可通过手动 `native_background` job 使用专用已登录 Mac runner。
 
 每次交付记录客户端 commit、桌面版本、Portal commit、平台/架构和验证范围。更新桌面版本使用 `npm version <新版本> --no-git-tag-version` 同步 `package.json` / lockfile，然后重新构建；不要只改原网页的 `VERSION`。依赖风险应以交付时重新执行的 `npm audit` 为准，README 中的历史构建记录不代表永久无漏洞。

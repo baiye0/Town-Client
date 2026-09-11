@@ -58,6 +58,7 @@ let lifecycleError = '';
 let mutation = Promise.resolve();
 let prepareInstallerShutdown: ((target: string) => void) | undefined;
 let pendingInstallerTarget: string | undefined;
+let windowReady = false;
 const exclusive = <T>(operation: () => Promise<T>): Promise<T> => {
   const next = mutation.then(operation);
   mutation = next.then(() => {}, () => {});
@@ -75,12 +76,13 @@ async function openExternal(url: string) {
 }
 function showWindow() {
   if (quitting) return;
-  if (!window) { if (store) createWindow(); return; }
+  if (!window) { if (windowReady) createWindow(); return; }
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
 }
 function createWindow() {
+  if (window && !window.isDestroyed()) return;
   const acrylic = process.platform === 'win32' && Number(os.release().split('.')[2]) >= 22621;
   window = new BrowserWindow({
     width: 1280, height: 860, minWidth: 920, minHeight: 640, title: CLIENT_NAME,
@@ -186,11 +188,6 @@ async function ready() {
       });
     });
   };
-  if (pendingInstallerTarget) {
-    const target = pendingInstallerTarget;
-    pendingInstallerTarget = undefined;
-    prepareInstallerShutdown(target);
-  }
   let startupDeferred = false;
   // Only the trusted top-level local shell can control local capabilities.
   const handle = (channel: string, callback: (...args: any[]) => unknown) => {
@@ -534,13 +531,11 @@ async function ready() {
       const connection = store.connection;
       await takeover.run(connection, intent, async replacing => {
         if (replacing) { await startClientPortal(true); return; }
-        if (installIntent && app.getVersion() === installIntent.from) {
+        if (installIntent && app.getVersion() === installIntent.from && installIntent.from !== installIntent.target) {
           await clientInstall.resume(installIntent);
           if (installIntent.foreground) await portal.start(store.settings, connection);
           else await publishBackground();
-          runtimeUpdate = installIntent.from === installIntent.target
-            ? { phase: 'current', message: '客户端已重新安装，已恢复原 Portal。' }
-            : { phase: 'error', message: '客户端安装未完成，已恢复安装前的 Portal。' };
+          runtimeUpdate = { phase: 'error', message: '客户端安装未完成，已恢复安装前的 Portal。' };
           return;
         }
         const updater = new RuntimeUpdater(directory, background, process.platform, undefined, undefined,
@@ -579,9 +574,10 @@ async function ready() {
         }
         if (installIntent || store.settings.backgroundEnabled || store.settings.autoStart) {
           if (await observeExternal()) { /* Only identity-verified supervision is migrated. */ }
-          else if (installIntent || store.settings.backgroundEnabled) {
+          else if (installIntent?.foreground) await portal.start(store.settings, connection);
+          else if (store.settings.backgroundEnabled || installIntent?.services.some(item => item.enabled)) {
             await background.enable(store.settings, connection); await publishBackground();
-          } else await portal.start(store.settings, connection);
+          } else if (!installIntent && store.settings.autoStart) await portal.start(store.settings, connection);
         }
         if (installIntent) await clientInstall.finish();
       });
@@ -594,6 +590,13 @@ async function ready() {
       if (!quitting && window) void dialog.showMessageBox(window, { type: 'warning', title: 'Portal 更新未完成', message: runtimeUpdate.message, buttons: ['知道了'] });
     }
   }
+  const installerRequest = pendingInstallerTarget || installerTarget(process.argv);
+  if (installerRequest) {
+    pendingInstallerTarget = undefined;
+    prepareInstallerShutdown(installerRequest);
+    return;
+  }
+  windowReady = true;
   createWindow();
   await exclusive(() => restoreStartup());
   if (app.isPackaged && !process.env.PORTAL_DESKTOP_USER_DATA) {
@@ -620,7 +623,7 @@ else {
     const args = argv ?? [];
     const target = installerTarget(args);
     if (target) {
-      if (prepareInstallerShutdown) prepareInstallerShutdown(target);
+      if (prepareInstallerShutdown && windowReady) prepareInstallerShutdown(target);
       else pendingInstallerTarget = target;
       return;
     }

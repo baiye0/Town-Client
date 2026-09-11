@@ -4,7 +4,9 @@
 
 菜单“检查更新”读取正式发布版本；客户端启动及每 6 小时检查一次，有更新时菜单显示目标版本。发布信息读取失败不会阻断聊天或 Portal。用户点击“下载并升级”后从固定 GitHub 正式发布地址下载平台安装包，并校验发布摘要。自动检测不会自动安装。
 
-先结束本机任务并保存聊天草稿。安装包下载、摘要校验及 macOS 应用暂存完成后，用户点击“停止 Portal 并安装”。客户端先持久保存原运行记录，停用并确认旧 Portal 及对应守护退出，然后关闭自身；独立安装助手等待旧客户端退出，macOS 同目录备份并替换应用，Windows 执行 Squirrel Setup，成功后自动打开新版。新版使用原配置同步最新内置 Portal 和守护并自动运行。
+先结束本机任务并保存聊天草稿。安装包下载、摘要校验及 macOS 应用暂存完成后，用户点击“停止 Portal 并安装”。客户端先持久保存原运行记录，停用并确认旧 Portal 及对应守护退出，然后关闭自身；独立安装助手等待旧客户端退出，macOS 同目录备份并替换应用，Windows 执行 NSIS Setup，成功后由助手打开新版一次。新版使用原配置同步最新内置 Portal 和守护。
+
+Windows 手动运行 Setup 时显示标准安装向导，可选择目录并查看进度，在完成页选择打开客户端。旧 Squirrel 安装迁移到新目录前通过旧版自带的卸载程序移除，用户数据目录保留。过旧的客户端若不支持退出协议，安装会提示先从托盘退出并停止 Portal 后重试。
 
 下载或暂存失败不停止服务；停止失败不执行安装；安装失败重新打开旧客户端时恢复原运行记录。macOS 替换失败会恢复旧应用。安装日志及旧应用备份保留以便诊断。旧版本尚无这个入口时，仍可手动替换应用或运行 Setup，新版首次启动会补做完整的停止、同步与恢复；不要删除用户配置目录。
 
@@ -29,7 +31,7 @@
 
 - `npm version X.Y.Z --no-git-tag-version` 同步客户端与 lockfile 版本。
 - `npm run build:portal` 构建配套源码；`npm run make` 打包时从实际二进制读取版本、计算摘要并生成清单。不要复用未知来源或不对应源码的二进制。
-- `.github/workflows/release.yml` 手动触发时只测试和构建，用于发版前验证。确认后推送版本 tag：两个平台构建和 Windows 原生升级测试通过、包内引擎摘要核对后，先创建草稿并上传全部安装包、清单及摘要，最后公开为正式 Release。上传失败保留草稿。
+- `.github/workflows/release.yml` 仅由版本 tag 触发：两个平台构建和 Windows 原生升级测试通过、包内引擎摘要核对后，先创建草稿并上传全部安装包、清单及摘要，最后公开为正式 Release。上传失败保留草稿。普通 push/PR 只测试，不生成发布安装包。
 - 更新 `desktop/RELEASE_NOTES.md` 后再创建版本 tag；草稿和预发布不会提示用户更新。该首版不提供 Intel Mac 安装包。
 - 默认更新源为 `baiye0/Town-Client`。私有仓库无法匿名检测：应在构建时设置 `PORTAL_DESKTOP_UPDATE_REPOSITORY=owner/public-release-repo`（Actions 中使用同名 repository variable），只公开版本及二进制；不内置 GitHub token。保持私有时可在浏览器登录发布页下载。
 - 下载和安装由用户手动触发；macOS Developer ID、公证及 Windows Authenticode 仍需正式发布配置；SHA-256 检查只能校验包内一致性，不能代替签名和来源信任。
@@ -40,4 +42,4 @@
 
 `PORTAL_DESKTOP_NATIVE_UPGRADE_TESTS=1 npx vitest run tests/runtime-update-native.test.ts` 在 macOS 上使用隔离 profile 和真实 LaunchAgent，验证离线升级及坏引擎回滚。Windows PowerShell 中先设置 `$env:PORTAL_DESKTOP_NATIVE_UPGRADE_TESTS='1'`，同一测试验证计划任务路径；需要可用的交互式用户会话。该测试不触碰日常 Portal。Windows 实机结果应单独记录，不能用 mock 通过代替。
 
-Windows 发布构建还会运行实际 Setup，确认安装助手自动打开安装目录中的新客户端。macOS 安装助手使用同目录重命名与备份；无写权限时在停止 Portal 前报错。
+Windows 发布构建还会运行实际 NSIS Setup，验证带空格的自定义目录、运行中的客户端及 Portal 退出、配置保留、内置引擎恢复和单窗口启动。macOS 安装助手使用同目录重命名与备份；无写权限时在停止 Portal 前报错。

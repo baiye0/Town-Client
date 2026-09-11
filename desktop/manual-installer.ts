@@ -71,13 +71,21 @@ try {
     $remaining | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
   }
-  $result=Start-Process -FilePath ${ps(setup)} -ArgumentList '--silent' -PassThru
+  # NSIS preserves the current installation location. /D must be the last
+  # argument and must not be quoted, even when the directory contains spaces.
+  $installDirectory=Split-Path -Parent $oldExecutable
+  if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $installDirectory) 'Update.exe')) {
+    $installDirectory=Join-Path $env:LOCALAPPDATA 'Programs/portal-desktop'
+  }
+  $result=Start-Process -FilePath ${ps(setup)} -ArgumentList ('/S /D=' + $installDirectory) -PassThru
   # Wait for Setup itself, not any newly launched long-lived client descendants.
   $result.WaitForExit()
   if ($result.ExitCode -ne 0) { throw 'Client installation failed' }
-  $updater=Join-Path $env:LOCALAPPDATA 'portal-desktop/Update.exe'
-  if (!(Test-Path -LiteralPath $updater)) { throw 'Installed client missing' }
-  Start-Process -FilePath $updater -ArgumentList '--processStart','portal-desktop.exe'
+  $installed=Join-Path $installDirectory 'portal-desktop.exe'
+  if (!(Test-Path -LiteralPath $installed)) { throw 'Installed client missing' }
+  # Assisted NSIS /S does not run the finish-page launch action. This helper
+  # is the only launch owner for in-app updates, and preserves its environment.
+  Start-Process -FilePath $installed
 } catch {
   Start-Process -FilePath ${ps(oldExecutable)}
   throw
