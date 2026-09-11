@@ -15,8 +15,22 @@ export function mountChatLinks(send: (message: Record<string, unknown>) => void)
     // Loom owns streaming HTML; decorate after it finalizes the current message.
     if (!content.isConnected || content.classList.contains('stream-cursor')) return;
     const linked = new Set<PlaceView>();
+    for (const code of content.querySelectorAll('code')) {
+      // A standalone URL is still a link when the Being formats it as code.
+      // Read across syntax-highlighting spans and retain the original copyable text.
+      if (code.closest('a,button') || code.querySelector('a,button')) continue;
+      const value = code.textContent?.trim() || '';
+      if (!/^https?:\/\/[^\s<>"'`]+$/i.test(value)) continue;
+      let url: URL;
+      try { url = new URL(value); } catch { continue; }
+      if (url.username || url.password) continue;
+      const link = document.createElement('a');
+      link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+      link.className = 'chat-code-link'; link.title = '在内置浏览器打开';
+      while (code.firstChild) link.append(code.firstChild);
+      code.append(link);
+    }
     for (const link of content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
-      if (link.closest('pre,code')) continue;
       const target = placeFromURL(link.getAttribute('href')!);
       if (target) { targets.set(link, target); link.classList.add('chat-place-link'); link.title = `在这里打开${placeNames[target.view]}${target.id ? '详情' : ''}`; linked.add(target.view); }
     }
