@@ -44,5 +44,7 @@ it('selects only supported assets, requires one digest and generates wait/replac
   expect(mac).toContain('/usr/bin/open -n');
   const windows = windowsInstallerScript(123, 'C:\\Setup.exe', 'C:\\old.exe');
   expect(windows.indexOf('Wait-Process')).toBeLessThan(windows.indexOf('Start-Process'));
+  expect(windows).toContain("$_.ExecutablePath -eq $oldExecutable");
+  expect(windows).toContain('Stop-Process -Id $_.ProcessId -Force');
   expect(windows).toContain("'--processStart','portal-desktop.exe'");
 });

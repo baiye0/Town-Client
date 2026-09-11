@@ -104,7 +104,11 @@ export class PortalSupervisor extends EventEmitter {
         if (sample) { boot = sample.boot_id; lastSequence = sample.sequence; }
         const ready = !sample && await readPortalReady(path.join(root, '.portal-ready.json'), child.pid, nonce);
         if (finished || this.child !== child || !this.wanted) return;
-        this.publish(portalSampleState(sample, Boolean(ready)));
+        // Reassert launch identity on every verified sample. Main-process
+        // observers may temporarily replace the public state while takeover or
+        // background discovery runs; a connected foreground Portal must still
+        // expose the PID and ownership of the child this supervisor launched.
+        this.publish({ ...portalSampleState(sample, Boolean(ready)), pid: child.pid, managed: true, runtimePath: root, conflict: false });
       } finally { polling = false; }
     }, 1000);
     statusTimer.unref?.();

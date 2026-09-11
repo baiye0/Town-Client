@@ -33,7 +33,8 @@ describe('Portal Kit integration', () => {
     await writeFile(manifest, JSON.stringify({ ...fixture, name: '../escape' })); await expect(readKit(src)).rejects.toThrow('名称');
     await writeFile(manifest, JSON.stringify({ ...fixture, platform: ['unsupported'] })); await expect(importLocalKit(src, path.join(dir, 'kits'))).rejects.toThrow('不支持');
     await writeFile(manifest, JSON.stringify({ ...fixture, command: ['{{KIT_HOME}}/run'] })); await expect(importLocalKit(src, path.join(dir, 'kits'))).rejects.toThrow('占位符');
-    await writeFile(manifest, JSON.stringify(fixture)); await symlink(path.join(dir, 'outside'), path.join(src, 'link')); await expect(importLocalKit(src, path.join(dir, 'kits'))).rejects.toThrow('链接');
+    const outside = path.join(dir, 'outside'); await mkdir(outside);
+    await writeFile(manifest, JSON.stringify(fixture)); await symlink(outside, path.join(src, 'link'), process.platform === 'win32' ? 'junction' : 'dir'); await expect(importLocalKit(src, path.join(dir, 'kits'))).rejects.toThrow('链接');
   });
   it('imports a selected directory alias without modifying the source', async () => {
     const src = await source(), alias = path.join(dir, 'alias'); await symlink(src, alias, process.platform === 'win32' ? 'junction' : 'dir');

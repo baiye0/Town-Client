@@ -38,7 +38,6 @@ const api: DesktopAPI = {
   prepareKit: id => ipcRenderer.invoke('beings:kit-prepare', id),
   installKit: input => ipcRenderer.invoke('beings:kit-install', input),
   discardKit: ticket => ipcRenderer.invoke('beings:kit-discard', ticket),
-  applyKits: () => ipcRenderer.invoke('beings:kits-apply'),
   openKits: () => ipcRenderer.invoke('beings:kits-open'),
   openTownLink: route => ipcRenderer.invoke('beings:town-open', route),
   snapshot: () => ipcRenderer.invoke('beings:snapshot'),

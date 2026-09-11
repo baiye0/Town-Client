@@ -336,7 +336,9 @@ if ([string]$t.State -eq 'Running' -and (Test-Path -LiteralPath $pidFile)) {
   async registerWindows(service: Service) {
     const args = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + windowsArgument(path.join(service.root, 'run.ps1'));
     await this.powershell(`$user=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;
-$a=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${ps(args)};
+$powershell=Join-Path $PSHOME 'powershell.exe';
+if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) { throw 'Windows PowerShell executable is unavailable' };
+$a=New-ScheduledTaskAction -Execute $powershell -Argument ${ps(args)};
 ${service.login === false ? '' : '$t=New-ScheduledTaskTrigger -AtLogOn -User $user;'}
 $p=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited;
 $s=New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable;

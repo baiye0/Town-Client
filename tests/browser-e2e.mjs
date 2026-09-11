@@ -33,8 +33,10 @@ try {
   await page.waitForFunction(async () => !(await window.beings.browserState()).loading);
   await native('document.cookie="fixture=retained; path=/"; document.querySelector("a").click()');
   await page.waitForFunction(() => document.querySelector('#browser-title').textContent === '第二页');
+  await page.waitForFunction(() => !document.querySelector('#browser-back').disabled);
   await page.locator('#browser-back').click();
   await page.waitForFunction(() => document.querySelector('#browser-title').textContent === '浏览器测试');
+  await page.waitForFunction(() => !document.querySelector('#browser-forward').disabled);
   await page.locator('#browser-forward').click();
   await page.waitForFunction(() => document.querySelector('#browser-title').textContent === '第二页');
   await page.locator('#options-trigger').click();

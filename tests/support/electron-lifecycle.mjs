@@ -48,12 +48,18 @@ export async function launchDesktop(options) {
   try { app = await electron.launch(options); } catch (error) { await release(); throw error; }
   const child = app.process();
   const originalClose = app.close.bind(app);
-  let closed = false;
+  let cleanupPromise;
   const kill = () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); };
   const onSignal = () => { kill(); };
   const deadline = setTimeout(() => { console.error('桌面测试超过 5 分钟，停止该测试实例。'); process.exitCode = 1; kill(); }, 300000);
   deadline.unref();
-  const cleanup = async () => { if (closed) return; closed = true; clearTimeout(deadline); process.removeListener('exit', kill); process.removeListener('SIGINT', onSignal); process.removeListener('SIGTERM', onSignal); await release(); };
+  const cleanup = () => cleanupPromise ??= (async () => {
+    clearTimeout(deadline);
+    process.removeListener('exit', kill);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+    await release();
+  })();
   process.once('exit', kill);
   process.once('SIGINT', onSignal); process.once('SIGTERM', onSignal);
   child.once('exit', () => { void cleanup(); });

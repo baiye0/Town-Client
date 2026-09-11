@@ -22,6 +22,12 @@ try {
     if (['error', 'warning'].includes(message.type()) && message.text() !== initialFrameWarning) errors.push(message.text());
   });
   await page.getByRole('button', { name: '连接我的 Being' }).waitFor();
+  const nativeChrome = await app.evaluate(({ BrowserWindow, Menu }) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    return { menu: Menu.getApplicationMenu() !== null, menuBarVisible: window.isMenuBarVisible(), menuBarAutoHide: window.isMenuBarAutoHide() };
+  });
+  if (process.platform === 'win32') assert.deepEqual(nativeChrome, { menu: false, menuBarVisible: false, menuBarAutoHide: true });
+  else assert.equal(nativeChrome.menu, true);
   assert.equal(await page.locator('#open-loom').isDisabled(), true);
   await assert.rejects(page.evaluate(() => window.beings.openLoom()), /请先配置 Being/);
   assert.match(page.url(), /^beings:\/\/desktop\//);
@@ -68,8 +74,10 @@ try {
   const windowId = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].id);
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible()), false);
-  // Exercise the same menu callback used to restore from the tray.
-  await app.evaluate(({ Menu }) => Menu.getApplicationMenu().items.find(item => item.label === '客户端').submenu.items[0].click());
+  // Windows deliberately has no native menu; a second launch uses the same
+  // showWindow callback as the tray and restores the existing window.
+  if (process.platform === 'win32') await app.evaluate(({ app }) => app.emit('second-instance'));
+  else await app.evaluate(({ Menu }) => Menu.getApplicationMenu().items.find(item => item.label === '客户端').submenu.items[0].click());
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible()), true);
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].id), windowId);
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
@@ -81,7 +89,7 @@ try {
   await page.locator('#quit-client').click();
   await closed;
   app = null;
-  console.log('PASS: client settings without Being connection, login toggle/readback (OS API fixture), close hides, menu/second launch restores same window, explicit exit');
+  console.log('PASS: client settings without Being connection, native chrome, login toggle/readback (OS API fixture), close hides, menu/second launch restores same window, explicit exit');
 } finally {
   if (app) await app.close();
   await rm(temporary, { recursive: true, force: true });

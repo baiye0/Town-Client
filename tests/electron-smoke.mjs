@@ -86,6 +86,20 @@ let app;
 let pid;
 let backgroundTest = false;
 let cleanupPromise;
+async function openOptions(page) {
+  const options = page.locator('#conversation-options');
+  if ((await options.getAttribute('open')) === null) await options.locator('summary').click();
+  return options;
+}
+async function openChatSearch(page) {
+  const toggle = page.locator('#toggle-chat-search');
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') await (await openOptions(page)).locator('#toggle-chat-search').click();
+}
+async function openPlace(page, view) {
+  if (view === 'chat') { await page.locator('#back-to-chat').click(); return; }
+  const options = await openOptions(page);
+  await options.locator(`[data-view="${view}"]`).click();
+}
 function cleanup() {
   return cleanupPromise ??= (async () => {
     if (app) await app.close().catch(() => {});
@@ -133,7 +147,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const importedConfig = path.join(dir, 'portal.toml');
   await writeFile(importedConfig, `workspace = ${JSON.stringify(path.join(dir, '工作目录'))}\nkits_dir = ${JSON.stringify(path.join(dir, 'kits'))}\nkits_enabled = true\n[tools]\nexec = false\nscreenshot = false\n`);
   await page.evaluate(async config => { const { settings } = await window.beings.snapshot(); await window.beings.save({ ...settings, portalConfigPath: config, kitsEnabled: true }); }, importedConfig);
-  await page.locator('nav [data-view="portal"]').click();
+  await openPlace(page, 'portal');
   await page.waitForFunction(() => document.querySelector('#portal-phase').textContent === '已连接', { timeout: 20000 });
   pid = (await page.evaluate(() => window.beings.snapshot())).portal.pid;
   const list = await rpc('tools/list');
@@ -141,7 +155,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   assert(list.tools.some(tool => tool.name === 'desktop_fixture_ping'));
   const kitReply = await rpc('tools/call', { name: 'desktop_fixture_ping', arguments: { value: 'connected' } });
   assert(JSON.stringify(kitReply).includes('Kit reply: connected'));
-  // Install a second real Kit through the client's Grove download IPC, then apply it to Portal.
+  // Install a second real Kit through the client's Grove download IPC. Portal
+  // owns discovery and hot reload, so the connection must remain uninterrupted.
   const downloadedSource = path.join(dir, 'download-source'); await mkdir(downloadedSource);
   await writeFile(path.join(downloadedSource, 'manifest.json'), JSON.stringify({ name: 'client-download', version: '1.0', command: [process.execPath, 'server.mjs'], tools: [{ name: 'ping', description: 'Downloaded fixture ping' }] }));
   await writeFile(path.join(downloadedSource, 'server.mjs'), await readFile(path.join(kitDir, 'server.mjs')));
@@ -155,19 +170,23 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return window.beings.installKit({ ticket: plan.ticket, environment: {} });
   });
   assert.equal(installed.name, 'client-download');
-  const beforeKitApply = handshakeCount;
-  await page.evaluate(() => window.beings.applyKits());
-  await page.waitForFunction(() => document.querySelector('#portal-phase').textContent === '已连接', { timeout: 20000 });
-  assert(handshakeCount > beforeKitApply);
-  assert((await rpc('tools/list')).tools.some(tool => tool.name === 'client_download_ping'));
+  const beforeKitReload = handshakeCount, kitDeadline = Date.now() + 15000;
+  let reloadedTools;
+  while (Date.now() < kitDeadline) {
+    reloadedTools = await rpc('tools/list');
+    if (reloadedTools.tools.some(tool => tool.name === 'client_download_ping')) break;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  assert(reloadedTools.tools.some(tool => tool.name === 'client_download_ping'));
+  assert.equal(handshakeCount, beforeKitReload, 'Kit hot reload must not reconnect Portal');
   const downloadReply = await rpc('tools/call', { name: 'client_download_ping', arguments: { value: 'installed via client' } });
   assert(JSON.stringify(downloadReply).includes('Kit reply: installed via client'));
-  console.log('PASS: client download, archive installation, MCP preflight, Portal apply and real downloaded Kit tool call.');
+  console.log('PASS: client download, atomic installation, Portal hot reload and real downloaded Kit tool call without reconnecting.');
   assert(!list.tools.some(tool => tool.name === 'portal_exec'));
   assert(!list.tools.some(tool => tool.name === 'portal_screenshot'));
   const rejected = await rpc('tools/call', { name: 'portal_file_write', arguments: { path: '../outside.txt', content: 'no' } });
   assert(rejected.isError || JSON.stringify(rejected).includes('outside workspace'));
-  await page.locator('nav [data-view="chat"]').click();
+  await openPlace(page, 'chat');
   await frame.locator('#file-input').setInputFiles({ name: 'note.txt', mimeType: 'text/plain', buffer: Buffer.from('attachment fixture') });
   await frame.locator('#pending-files.active').waitFor();
   await frame.locator('#input').fill('请帮我写一份问候。');
@@ -205,7 +224,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   await childFrame.evaluate(() => addMessage('being', '索引浏览时收到新回复。'));
   await page.waitForTimeout(100);
   assert.equal(await childFrame.evaluate(() => document.querySelector('#messages').scrollTop), readingPosition);
-  await page.locator('#toggle-chat-search').click();
+  await openChatSearch(page);
   await page.locator('#chat-search-input').fill('第一项');
   await page.locator('.chat-search-result').waitFor();
   assert.equal(await page.locator('.chat-search-result').count(), 1);
@@ -213,6 +232,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   await page.screenshot({ path: 'test-results/chat-search.png' });
   await page.locator('.chat-search-result').click();
   assert.equal(await frame.locator('#input').inputValue(), '索引跳转保留的草稿');
+  await openChatSearch(page);
   await page.locator('#chat-search-input').fill('不存在的提问');
   assert.equal(await page.locator('#chat-search-status').textContent(), '没有匹配的提问');
   await page.locator('#chat-search-input').fill('第一项');
@@ -220,7 +240,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   assert.equal(await page.locator('.chat-search-result').count(), 1);
   await page.locator('#chat-search-input').press('Escape');
   assert.equal(await page.locator('#toggle-chat-search').getAttribute('aria-expanded'), 'false');
-  assert.equal(await page.locator('#chat-search-panel').evaluate(el => el.inert), true);
+  assert.equal(await page.locator('#chat-search-panel').evaluate(el => el.open), false);
   await frame.locator('#chat-index-latest').click();
   await childFrame.waitForFunction(() => {
     const messages = document.querySelector('#messages');
@@ -231,17 +251,18 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   console.log('PASS: tick previews/jump, sidebar search, scroll tracking, draft preservation and streaming scroll lock.');
   await mkdir('test-results', { recursive: true });
   await page.screenshot({ path: 'test-results/chat.png' });
-  // New composer controls remain usable without the original Loom header.
-  await frame.locator('#desktop-composer-tools button').first().dispatchEvent('click');
+  // Model settings and the compact options menu preserve the draft.
+  await (await openOptions(page)).locator('[data-chat-action="model"]').click();
   await frame.locator('#settings-panel.active').waitFor();
   await frame.locator('#settings-panel .btn-close').dispatchEvent('click');
   await frame.locator('#settings-panel.active').waitFor({ state: 'hidden' });
   await frame.locator('#input').fill('unsent draft');
-  await page.locator('#toggle-sidebar').click();
-  assert.equal(await page.locator('#navigation-sidebar').isVisible(), false);
+  const options = await openOptions(page);
+  assert.equal(await options.getAttribute('open'), '');
   assert.equal(await frame.locator('#input').inputValue(), 'unsent draft');
-  await page.locator('#toggle-sidebar').click();
-  await page.locator('#theme-toggle').click();
+  await options.locator('summary').click();
+  assert.equal(await frame.locator('#input').inputValue(), 'unsent draft');
+  await (await openOptions(page)).locator('#theme-toggle').click();
   await childFrame.waitForFunction(() => document.documentElement.dataset.theme === 'dark');
   assert.equal(await app.evaluate(({ nativeTheme }) => nativeTheme.themeSource), 'dark');
   await page.screenshot({ path: 'test-results/chat-dark.png' });
@@ -253,7 +274,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   await frame.locator('.run-activity.running .run-stop').waitFor();
   await frame.locator('.run-activity.running .run-stop').click();
   await page.waitForTimeout(300); assert.equal(stopCount, 1);
-  await page.locator('nav [data-view="portal"]').click();
+  await openPlace(page, 'portal');
   const beforeRestart = handshakeCount;
   await rpc('tools/call', { name: 'portal_restart', arguments: {} });
   await page.waitForTimeout(5500);
@@ -315,7 +336,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     const reattached = await reopened.evaluate(() => window.beings.snapshot());
     assert.notEqual(reattached.portal.pid, pid);
     pid = reattached.portal.pid;
-    await reopened.locator('nav [data-view="portal"]').click();
+    await openPlace(reopened, 'portal');
     await reopened.screenshot({ path: 'test-results/background-portal.png' });
     await reopened.locator('#portal-settings').click();
     assert.equal(await reopened.locator('#background-input').isChecked(), true);
@@ -324,11 +345,6 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     await reopened.locator('#close-settings').click();
     const stableHandshakes = handshakeCount;
     await reopened.waitForTimeout(1000); assert.equal(handshakeCount, stableHandshakes, 'reopening must not restart the existing background service');
-    await reopened.evaluate(() => window.beings.applyKits());
-    const applyDeadline = Date.now() + 20000;
-    while (handshakeCount === stableHandshakes && Date.now() < applyDeadline) await new Promise(resolve => setTimeout(resolve, 250));
-    assert(handshakeCount > stableHandshakes, 'applying Kits must restart the registered background service');
-    await reopened.waitForFunction(() => document.querySelector('#portal-phase').textContent === '已连接', { timeout: 15000 });
     pid = (await reopened.evaluate(() => window.beings.snapshot())).portal.pid;
     assert((await rpc('tools/list')).tools.some(tool => tool.name === 'client_download_ping'));
     await reopened.evaluate(() => window.beings.stopPortal());
@@ -338,7 +354,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     await app.close(); app = null;
     app = await launchDesktop({ executablePath, env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(dir, 'profile') } });
     const disabledWindow = await app.firstWindow();
-    await disabledWindow.waitForFunction(() => document.querySelector('#being-label').textContent === 'willow');
+    await disabledWindow.waitForFunction(() => document.querySelector('#conversation-name').textContent === 'willow');
     assert.equal((await disabledWindow.evaluate(() => window.beings.snapshot())).background.enabled, false);
     assert.throws(() => process.kill(pid, 0), /ESRCH/);
     console.log('PASS: real LaunchAgent install, tool call after client quit, SIGKILL recovery, login registration reload without client, reattach without restart, stop disables login startup across client restarts.');

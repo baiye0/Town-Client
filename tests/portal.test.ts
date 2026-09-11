@@ -54,6 +54,7 @@ describe('Portal supervision', () => {
     const status = { schema: 1, pid: child.pid, nonce: call[2].env.HEART_PORTAL_STATUS_NONCE, boot_id: 'test-boot', sequence: 1, state: 'connected', updated_at_ms: Date.now() };
     await writeFile(call[2].env.HEART_PORTAL_STATUS_FILE, JSON.stringify(status));
     await vi.waitFor(() => expect(f.portal.state.phase).toBe('connected'), { timeout: 2500 });
+    expect(f.portal.state).toMatchObject({ pid: child.pid, managed: true, runtimePath: f.dir, conflict: false });
     child.stdout.write('private-'); child.stdout.write('token\n');
     expect(f.portal.state.logs.join('\n')).not.toContain('private-token');
     child.stdout.write('relay session error after 20s: retry in 2s\n'); expect(f.portal.state.phase).toBe('connected');

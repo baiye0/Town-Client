@@ -17,7 +17,8 @@ export class ClientBrowser {
   private update(patch: Partial<BrowserState> = {}) {
     if (this.view && !this.view.webContents.isDestroyed()) {
       const contents = this.view.webContents;
-      this.state = { ...this.state, canGoBack: contents.navigationHistory.canGoBack(), canGoForward: contents.navigationHistory.canGoForward() };
+      const index = contents.navigationHistory.getActiveIndex(), entries = contents.navigationHistory.getAllEntries();
+      this.state = { ...this.state, canGoBack: index > 0, canGoForward: index >= 0 && index < entries.length - 1 };
     }
     this.state = { ...this.state, ...patch };
     if (!this.window.isDestroyed()) this.publish(this.state);
@@ -112,8 +113,9 @@ export class ClientBrowser {
     }
     const contents = this.view?.webContents;
     if (!contents || contents.isDestroyed()) return;
-    if (action === 'back' && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
-    if (action === 'forward' && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+    const index = contents.navigationHistory.getActiveIndex(), entries = contents.navigationHistory.getAllEntries();
+    if (action === 'back' && index > 0) contents.navigationHistory.goToIndex(index - 1);
+    if (action === 'forward' && index >= 0 && index < entries.length - 1) contents.navigationHistory.goToIndex(index + 1);
     if (action === 'reload') { this.update({ error: undefined }); this.layout(); contents.reload(); }
     if (action === 'stop') contents.stop();
   }

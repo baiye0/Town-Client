@@ -43,7 +43,16 @@ export class ExternalPortalObserver {
     } else if (this.platform === 'win32') {
       const script = windowsModulePath + `$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
 @(@(Get-CimInstance Win32_Process -Filter "Name LIKE 'heart-portal%.exe'") | ForEach-Object {
-  if ($_.ExecutablePath -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid -eq $sid) { @{pid=$_.ProcessId;binary=$_.ExecutablePath} }
+  $candidate=$_; $owner=$null
+  if ($candidate.ExecutablePath) {
+    try { $owner=Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid }
+    catch {
+      # A process can exit between the WMI snapshot and the ownership query.
+      # Skip only WBEM_E_NOT_FOUND; fail closed for every other owner error.
+      if ($_.FullyQualifiedErrorId -notmatch '^HRESULT 0x80041002,') { throw }
+    }
+  }
+  if ($owner -and $owner.Sid -eq $sid) { @{pid=$candidate.ProcessId;binary=$candidate.ExecutablePath} }
 }) | ConvertTo-Json -Compress`;
       const output = await this.run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]);
       const data = output.trim() ? JSON.parse(output) : [];

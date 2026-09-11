@@ -8,20 +8,20 @@ import { x as extract } from 'tar';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
 import { createGunzip } from 'node:zlib';
-import { StringDecoder } from 'node:string_decoder';
 import { TOWN_ORIGIN, TownClient } from './town';
 import { readKit, kitLocation } from './kits';
 import { redact } from './connection';
-import { command as systemCommand, windowsArgument } from './background';
 import type { Settings, KitInstallPlan, KitInstallInput } from './shared';
 
 const MAX_DOWNLOAD = 64 * 1024 * 1024;
 const MAX_FILES = 20000;
 const MAX_UNPACKED = 256 * 1024 * 1024;
 const hosts = new Set(['beings.town', 'github.com', 'codeload.github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com']);
-const ps = (s: string) => `'${s.replaceAll("'", "''")}'`;
-const sh = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 const exists = (file: string) => access(file).then(() => true, () => false);
+export function dotenv(values: Record<string, string>) {
+  const quote = (value: string) => `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n').replaceAll('\r', '\\r').replaceAll('\t', '\\t')}"`;
+  return Object.entries(values).filter(([, value]) => value).map(([name, value]) => `${name}=${quote(value)}`).join('\n') + '\n';
+}
 export function archivePath(value: string) {
   const name = value.replace(/^(\.\/)+/, '').replace(/\/$/, '');
   if (!name || name === '.') return '';
@@ -96,38 +96,6 @@ export async function runInstallCommand(program: string, args: string[], cwd: st
     const timer = setTimeout(() => { timedOut = true; kill(child); }, 300000);
     child.once('error', () => { clearTimeout(timer); reject(new Error(`找不到或无法运行 ${path.basename(program)}，请先安装对应运行环境。`)); });
     child.once('exit', code => { clearTimeout(timer); child.stdout?.destroy(); child.stderr?.destroy(); const secrets = Object.entries(env).filter(([key]) => /KEY|TOKEN|SECRET|PASSWORD/i.test(key)).map(([, value]) => value || ''); code === 0 ? resolve() : reject(new Error(timedOut ? '安装依赖超时，请重试。' : `安装依赖失败：${redact(output, secrets)}`)); });
-  });
-}
-export async function inspectTools(command: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command[0], command.slice(1), { cwd, env, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
-    let pending = '', bytes = 0, done = false; const decoder = new StringDecoder('utf8');
-    const finish = (error?: Error, tools?: any[]) => {
-      if (done) return; done = true; clearTimeout(timer); kill(child); child.stdout?.destroy(); child.stderr?.destroy();
-      const settle = () => error ? reject(error) : resolve(tools!);
-      if (!child.pid || child.exitCode !== null || child.signalCode !== null) settle();
-      else { const cleanupTimer = setTimeout(() => reject(new Error('Kit 检查进程未能结束，请重试。')), 5000); child.once('exit', () => { clearTimeout(cleanupTimer); settle(); }); }
-    };
-    const timer = setTimeout(() => finish(new Error('Kit 工具检查超时，请确认依赖和凭据配置。')), 20000);
-    const send = (message: object) => child.stdin?.write(JSON.stringify(message) + '\n');
-    child.once('error', () => finish(new Error(`无法启动 Kit：请检查 ${path.basename(command[0])} 是否已安装。`)));
-    child.once('exit', code => { if (!done) finish(new Error(`Kit 在工具检查时退出（${code}），请检查依赖和配置。`)); });
-    child.stdin?.on('error', () => {}); child.stderr?.resume();
-    child.stdout?.on('data', data => {
-      bytes += data.length; if (bytes > 1024 * 1024) return finish(new Error('Kit 工具检查输出过大。'));
-      pending += decoder.write(data); const lines = pending.split('\n'); pending = lines.pop() || '';
-      for (const line of lines) {
-        let message; try { message = JSON.parse(line); } catch { continue; }
-        if (message.error) return finish(new Error('Kit 拒绝了 MCP 工具检查，请检查依赖和凭据。'));
-        if (message.id === 1 && message.result) { send({ jsonrpc: '2.0', method: 'notifications/initialized' }); send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }); }
-        if (message.id === 2) {
-          const tools = message.result?.tools;
-          if (!Array.isArray(tools) || !tools.length || tools.length > 1000 || tools.some(t => !t || typeof t.name !== 'string' || !t.name || typeof t.description !== 'string')) return finish(new Error('Kit 没有返回有效的 MCP 工具列表。'));
-          return finish(undefined, tools);
-        }
-      }
-    });
-    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'beings-installer', version: '1' } } });
   });
 }
 interface Prepared { plan: KitInstallPlan; root: string; directory: string; manifest: any; settings: Settings; created: number }
@@ -215,30 +183,18 @@ export class KitInstaller {
     const check = resolve(item.directory);
     if (check.some(v => /\{\{.*?\}\}/.test(v))) throw new Error('Kit 启动命令包含未配置占位符，请联系作者提供可迁移的版本。');
     if (!path.isAbsolute(check[0]) && await exists(path.join(item.directory, check[0]))) check[0] = path.join(item.directory, check[0]);
-    const tools = await inspectTools(check, item.directory, { ...baseEnv, ...Object.fromEntries(Object.entries(supplied).filter(([, v]) => v)) });
     const command = resolve(target);
     if (!path.isAbsolute(command[0]) && await exists(path.join(item.directory, command[0]))) command[0] = path.join(target, command[0]);
     const finalManifest = { ...item.manifest };
-    // Persist per-kit configuration in a private launcher. Windows secrets use current-user DPAPI.
-    if (Object.values(supplied).some(Boolean)) {
-      if (process.platform === 'win32') {
-        const script = "[Console]::InputEncoding=[Text.UTF8Encoding]::new(); [Console]::In.ReadToEnd() | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString";
-        const encrypted = await systemCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], JSON.stringify(supplied));
-        await writeFile(path.join(item.directory, '.beings-env.dpapi'), encrypted.trim(), { mode: 0o600 });
-        const launcher = `\ufeff$ErrorActionPreference='Stop'\n$secret=Get-Content -LiteralPath (Join-Path $PSScriptRoot '.beings-env.dpapi') -Raw | ConvertTo-SecureString\n$values=([Net.NetworkCredential]::new('', $secret)).Password | ConvertFrom-Json\nforeach ($v in $values.PSObject.Properties) { if ($v.Value) { [Environment]::SetEnvironmentVariable($v.Name, $v.Value, 'Process') } }\n$si=New-Object Diagnostics.ProcessStartInfo\n$si.FileName=${ps(command[0])}\n$si.Arguments=${ps(command.slice(1).map(windowsArgument).join(' '))}\n$si.WorkingDirectory=$PSScriptRoot\n$si.UseShellExecute=$false\n$si.CreateNoWindow=$true\n$p=[Diagnostics.Process]::Start($si)\n$p.WaitForExit()\nexit $p.ExitCode\n`;
-        await writeFile(path.join(item.directory, '.beings-launch.ps1'), launcher, { mode: 0o600 });
-        finalManifest.command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(target, '.beings-launch.ps1')];
-      } else {
-        const launcher = '#!/bin/sh\nset -eu\n' + Object.entries(supplied).filter(([, v]) => v).map(([k, v]) => `export ${k}=${sh(v)}\n`).join('') + `cd ${sh(target)}\nexec ${command.map(sh).join(' ')}\n`;
-        await writeFile(path.join(item.directory, '.beings-launch.sh'), launcher, { mode: 0o600 });
-        finalManifest.command = ['/bin/sh', path.join(target, '.beings-launch.sh')];
-      }
-    } else finalManifest.command = command;
-    finalManifest.tools = tools.map(t => ({ name: t.name, description: t.description, params: t.inputSchema || { type: 'object', properties: {} } }));
+    finalManifest.command = command;
+    // Portal owns Kit configuration and process lifecycle. Keep credentials in
+    // its documented kit-local dotenv file instead of wrapping the command.
+    await rm(path.join(item.directory, '.env'), { force: true });
+    if (Object.values(supplied).some(Boolean)) await writeFile(path.join(item.directory, '.env'), dotenv(supplied), { mode: 0o600 });
     await writeFile(path.join(item.directory, 'manifest.json'), JSON.stringify(finalManifest, null, 2) + '\n');
-    await writeFile(path.join(item.directory, '.beings-install.json'), JSON.stringify({ sha256: item.plan.sha256, checkedAt: new Date().toISOString(), tools: tools.length }), { mode: 0o600 });
+    await writeFile(path.join(item.directory, '.beings-install.json'), JSON.stringify({ sha256: item.plan.sha256, installedAt: new Date().toISOString() }), { mode: 0o600 });
     await mkdir(location.directory, { recursive: true });
     await rename(item.directory, target); await this.discard(input.ticket);
-    return { name: item.plan.name, tools: tools.length, message: '已安装并通过 MCP 工具检查。请点击“重启 Portal 应用”，让 Being 重新获取工具。' };
+    return { name: item.plan.name, tools: item.plan.tools, message: '已安装。Portal 将自动刷新清单，并在首次调用时启动 Kit。' };
   }
 }

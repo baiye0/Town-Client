@@ -59,7 +59,6 @@ export interface DesktopAPI {
   prepareKit(id: string): Promise<KitInstallPlan>;
   installKit(input: KitInstallInput): Promise<{ name: string; tools: number; message: string }>;
   discardKit(ticket: string): Promise<void>;
-  applyKits(): Promise<PortalState>;
   openKits(): Promise<void>;
   openTownLink(route: string): Promise<void>;
   snapshot(): Promise<Snapshot>;

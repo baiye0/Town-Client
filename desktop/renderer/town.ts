@@ -586,7 +586,7 @@ export class TownViews {
     const close = button('', () => dialog.close(), 'close'); close.type = 'button'; close.setAttribute('aria-label', '取消 Kit 安装');
     heading.append(node('h2', '', `安装 ${plan.name}`), close);
     form.append(heading, node('p', '', plan.description), node('p', 'card-meta', `v${plan.version} · ${plan.tools} 个声明工具`));
-    form.append(node('p', 'field-help', plan.dependency === 'npm' ? '将安装 npm 依赖（包括包内安装脚本），然后启动 Kit 检查工具。' : plan.dependency === 'python' ? '将创建 Kit 专用 Python 环境、安装 requirements.txt，然后检查工具。' : '将启动 Kit 并检查可用工具，不调用具体工具。'));
+    form.append(node('p', 'field-help', plan.dependency === 'npm' ? '将安装 npm 依赖（包括包内安装脚本），再交给 Portal 管理。' : plan.dependency === 'python' ? '将创建 Kit 专用 Python 环境并安装 requirements.txt，再交给 Portal 管理。' : '安装完成后由 Portal 自动发现并按需启动。'));
     if (plan.notes) form.append(node('p', 'field-help', plan.notes));
     const inputs = new Map<string, HTMLInputElement>();
     for (const field of plan.environment) {
@@ -594,21 +594,21 @@ export class TownViews {
       const input = node('input'); input.id = id; input.type = 'password'; input.autocomplete = 'off'; input.required = field.required;
       form.append(label, input, node('p', 'field-help', field.description)); inputs.set(field.name, input);
     }
-    if (inputs.size) form.append(node('p', 'field-help', '配置仅用于此 Kit。macOS 使用私有文件保存，Windows 使用当前用户加密保护。'));
+    if (inputs.size) form.append(node('p', 'field-help', '配置写入 Kit 本地 .env，由 Portal 按清单注入。'));
     const error = node('p', 'form-error'); error.setAttribute('role', 'alert');
-    const submit = node('button', 'primary', '安装并检查工具'); submit.type = 'submit';
-    const footer = node('div', 'dialog-footer'); footer.append(node('span', '', '安装后可在本机 Kits 中立即应用'), submit);
+    const submit = node('button', 'primary', '安装到本机'); submit.type = 'submit';
+    const footer = node('div', 'dialog-footer'); footer.append(node('span', '', 'Portal 会自动刷新 Kit 清单'), submit);
     form.append(error, footer); dialog.append(form); document.body.append(dialog);
     let busy = false, installed = false;
     dialog.addEventListener('cancel', event => { if (busy) event.preventDefault(); });
     dialog.addEventListener('close', () => { inputs.forEach(input => { input.value = ''; }); dialog.remove(); if (!installed) void this.api.discardKit(plan.ticket).catch(() => {}); });
     form.addEventListener('submit', event => {
-      event.preventDefault(); if (busy) return; busy = true; close.disabled = true; submit.disabled = true; submit.textContent = '正在安装依赖并检查工具…'; error.textContent = '';
+      event.preventDefault(); if (busy) return; busy = true; close.disabled = true; submit.disabled = true; submit.textContent = '正在安装…'; error.textContent = '';
       void (async () => {
         try {
           const result = await this.api.installKit({ ticket: plan.ticket, environment: Object.fromEntries([...inputs].map(([name, input]) => [name, input.value])) });
           installed = true; dialog.close(); this.toast(`${result.name}：${result.message}`);
-          this.tab = 'local'; this.tabs.kits = 'local'; await this.load();
+          this.tab = 'local'; this.tabs.kits = 'local'; $<HTMLInputElement>('town-search').value = ''; await this.load();
         } catch (err) { error.textContent = String(err).replace(/^Error: Error invoking remote method '[^']+': Error: /, ''); }
         finally { busy = false; close.disabled = false; submit.disabled = false; submit.textContent = '重试安装'; }
       })();
@@ -618,10 +618,10 @@ export class TownViews {
   private renderLocal(library: KitLibrary) {
     const bar = node('div', 'local-kit-bar'); const path = node('div');
     path.append(node('small', 'card-meta', '沿用 Portal 的 Kit 目录'), node('code', '', library.directory));
-    bar.append(path, button('重启 Portal 应用', () => void this.run(async () => { await this.api.applyKits(); this.toast('Portal 正在重启并加载已安装的工具。'); })), button('打开目录 ↗', () => void this.run(() => this.api.openKits())), button('导入本地 Kit', () => void this.run(async () => {
-      const result = await this.api.importKit(); if (result.installed) { this.toast(`${result.name} 已导入。配置依赖后重启 Portal 即可加载。`); if (this.tab === 'local') await this.load(); }
+    bar.append(path, button('打开目录 ↗', () => void this.run(() => this.api.openKits())), button('导入本地 Kit', () => void this.run(async () => {
+      const result = await this.api.importKit(); if (result.installed) { this.toast(`${result.name} 已导入。Portal 将自动刷新清单。`); if (this.tab === 'local') await this.load(); }
     }), 'primary')); $('town-body').append(bar);
-    const hint = node('p', 'local-kit-hint', library.enabled ? 'Portal 约每 60 秒刷新 Kit 清单。点击“重启 Portal 应用”可立即重新加载并连接 Being；进行中的工具任务会中断。' : '当前 Portal 配置关闭了 Kits。启用并重启 Portal 后才能调用这些工具。'); $('town-body').append(hint);
+    const hint = node('p', 'local-kit-hint', library.enabled ? 'Portal 约每 5 秒自动刷新 Kit 清单，并在 Being 首次调用工具时启动对应 Kit。' : '当前 Portal 配置关闭了 Kits。启用后重启 Portal 才能调用这些工具。'); $('town-body').append(hint);
     if (!library.kits.length) {
       const empty = node('div', 'empty-state'); empty.append(node('div', 'empty-symbol', '◇'), node('h2', '', '给 Being 添一件工具'), node('p', '', '尚未发现本机 Kit。去 Grove 查看工具，或导入你已有的 Kit 目录。'), button('浏览 Grove →', () => { this.tab = 'grove'; this.tabs.kits = 'grove'; void this.load(); }, 'primary')); $('town-body').append(empty); return;
     }

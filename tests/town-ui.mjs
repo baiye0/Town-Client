@@ -20,6 +20,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.pa
   app = await launchDesktop({ executablePath, env: { ...process.env, PORTAL_DESKTOP_USER_DATA: path.join(dir, 'profile') } });
   const page = await app.firstWindow();
   await app.context().tracing.start({ screenshots: true, snapshots: true });
+  await app.evaluate(({ protocol }) => {
+    protocol.handle('http', request => new URL(request.url).host === '127.0.0.1:1'
+      ? Response.json({ being_name: 'willow', messages: [] })
+      : new Response('fixture only', { status: 404 }));
+  });
   const config = path.join(dir, 'portal.toml');
   await writeFile(config, `workspace = ${JSON.stringify(dir)}\nkits_dir = ${JSON.stringify(path.join(dir, 'kits'))}\nkits_enabled = true\n`);
   await page.evaluate(async ({ dir, config }) => {
@@ -53,7 +58,19 @@ readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.pa
       return json({ error: 'not found' }, 404);
     });
   }, (await readFile(bundle)).toString('base64'));
-  const nav = async name => { await page.locator(`nav [data-view="${name}"]`).click(); await page.waitForFunction(() => !document.querySelector('#town-body').hasAttribute('aria-busy')); };
+  const nav = async name => {
+    if (await page.locator('#place-sheet').evaluate(element => element.open)) await page.locator('#back-to-chat').click();
+    if (['town', 'kits', 'portal'].includes(name)) {
+      const options = page.locator('#conversation-options');
+      if ((await options.getAttribute('open')) === null) await options.locator('summary').click();
+      await options.locator(`[data-view="${name}"]`).click();
+    } else {
+      const frame = page.frameLocator('#chat-frame');
+      await frame.locator('#chat-places-trigger').click();
+      await frame.locator(`[data-place="${name}"]`).click();
+    }
+    await page.waitForFunction(() => !document.querySelector('#town-body').hasAttribute('aria-busy'));
+  };
   await nav('town'); await page.getByText('4 项服务').waitFor();
   assert.deepEqual(await page.getByRole('tab').allTextContents(), ['服务目录', '最近更新']);
   assert.equal(await page.locator('#town-body').getByText(/居民/).count(), 0);
@@ -75,11 +92,12 @@ readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.pa
   await page.getByRole('heading', { name: '安装 downloaded-kit', exact: true }).waitFor();
   await page.locator('#kit-env-FIXTURE_API_KEY').fill('fixture-value');
   await mkdir('test-results', { recursive: true }); await page.screenshot({ path: 'test-results/kit-install.png' });
-  await page.getByRole('button', { name: '安装并检查工具', exact: true }).click();
+  await page.locator('.kit-install-form').getByRole('button', { name: '安装到本机', exact: true }).click();
   await page.locator('.catalog-item').filter({ hasText: 'downloaded-kit' }).waitFor({ timeout: 60000 });
   const downloaded = JSON.parse(await readFile(path.join(dir, 'kits/downloaded-kit/manifest.json'), 'utf8'));
   assert.equal(downloaded.tools[0].name, 'downloaded_ping');
   assert(!JSON.stringify(downloaded).includes('fixture-value'));
+  assert((await readFile(path.join(dir, 'kits/downloaded-kit/.env'), 'utf8')).includes('FIXTURE_API_KEY="fixture-value"'));
   assert.equal(await page.locator('#kit-env-FIXTURE_API_KEY').count(), 0);
   // Real importer: native chooser and confirmation are mocked only inside the test process.
   const source = path.join(dir, 'test-kit'); await mkdir(source);

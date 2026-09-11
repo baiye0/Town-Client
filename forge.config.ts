@@ -4,6 +4,7 @@ import { MakerZIP } from '@electron-forge/maker-zip';
 import { MakerSquirrel } from '@electron-forge/maker-squirrel';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { wrapWindowsInstallers } from './scripts/wrap-windows-installer';
 
 const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-portal.exe' : 'heart-portal');
 const config: ForgeConfig = {
@@ -18,6 +19,10 @@ const config: ForgeConfig = {
   hooks: {
     prePackage: async () => {
       if (!existsSync(binary)) throw new Error('Portal binary missing. Run npm run build:portal first.');
+    },
+    postMake: async (_forgeConfig, makeResults) => {
+      if (process.platform === 'win32') await wrapWindowsInstallers(makeResults.flatMap(result => result.artifacts));
+      return makeResults;
     },
   },
   makers: [new MakerZIP({}, ['darwin', 'linux', 'win32']), new MakerSquirrel({ name: 'portal-desktop', setupIcon: path.resolve('resources/branding/app.ico') })],

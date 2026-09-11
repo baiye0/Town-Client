@@ -16,7 +16,10 @@ it('ignores the Windows bootstrap PID and verifies its supervised child before t
     let listings = 0;
     const run: Command = async (_file, args) => {
       const script = Buffer.from(args.at(-1)!, 'base64').toString('utf16le');
-      if (script.includes('GetOwnerSid')) return JSON.stringify(++listings === 1 ? [{ pid: 11, binary }] : [{ pid: 11, binary }, { pid: 22, binary }]);
+      if (script.includes('GetOwnerSid')) {
+        expect(script).toContain("FullyQualifiedErrorId -notmatch '^HRESULT 0x80041002,'");
+        return JSON.stringify(++listings === 1 ? [{ pid: 11, binary }] : [{ pid: 11, binary }, { pid: 22, binary }]);
+      }
       return JSON.stringify({ ready: true, supervised: true, pid: 22 });
     };
     const services = await new ExternalPortalObserver(run, 'win32').forUpgrade(connection, 'fixture');

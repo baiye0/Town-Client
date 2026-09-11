@@ -57,6 +57,20 @@ $ErrorActionPreference='Stop'
 Wait-Process -Id ${parentPid} -Timeout 120 -ErrorAction SilentlyContinue
 if (Get-Process -Id ${parentPid} -ErrorAction SilentlyContinue) { exit 1 }
 try {
+  # Chromium children can briefly outlive the Electron main process and keep
+  # native DLLs locked. Give them time to exit, then stop only processes that
+  # still run from the exact client executable being replaced.
+  $oldExecutable=${ps(oldExecutable)}
+  $deadline=(Get-Date).AddSeconds(15)
+  do {
+    $remaining=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $oldExecutable })
+    if ($remaining.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 250
+  } while ((Get-Date) -lt $deadline)
+  if ($remaining.Count -gt 0) {
+    $remaining | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 500
+  }
   $result=Start-Process -FilePath ${ps(setup)} -ArgumentList '--silent' -PassThru
   # Wait for Setup itself, not any newly launched long-lived client descendants.
   $result.WaitForExit()

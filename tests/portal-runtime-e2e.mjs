@@ -61,11 +61,15 @@ try {
   }, { connectionLink: `http://127.0.0.1:${server.address().port}/fixture/?token=${token}`, workspace: path.join(temporary, '中文 workspace') });
   const state = async () => (await page.evaluate(() => window.beings.snapshot())).portal;
   await until(async () => (await state()).phase === 'connected');
-  const pid = (await state()).pid;
-  assert(Number.isInteger(pid));
+  const connected = await state();
+  const pid = connected.pid;
+  assert(Number.isInteger(pid), `connected Portal must expose its PID: ${JSON.stringify(connected)}`);
   // Capture the OS browser handoff; never open a real browser or real Being.
   await app.evaluate(({ shell, session }) => {
     session.fromPartition('persist:beings-browser').protocol.handle('https', () => new Response('<title>Fixture</title>', { headers: { 'content-type': 'text/html' } }));
+    session.defaultSession.protocol.handle('https', request => new URL(request.url).hostname === 'example.invalid'
+      ? Response.json({ being_name: 'second_being', messages: [] })
+      : new Response('fixture only', { status: 404 }));
     globalThis.loomTargets = [];
     shell.openExternal = async url => { globalThis.loomTargets.push(url); };
   });

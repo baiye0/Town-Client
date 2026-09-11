@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, net, nativeTheme, nativeImage, protocol, safeStorage, session, shell, Menu, Tray } from 'electron';
 import { clientStartup } from './client-startup';
+import { clientUserData } from './client-profile';
 import { ClientBrowser } from './browser';
 import path from 'node:path';
 import os from 'node:os';
@@ -12,7 +13,7 @@ import { RuntimeUpdater, loadRuntimeBundle, type RuntimeUpdateResult } from './r
 import { UpdateChecker } from './updates';
 import { ClientInstall } from './client-install';
 import { stageInstaller } from './manual-installer';
-import { installerEvent, handleInstallerEvent } from './installer-events';
+import { installerEvent, installerTarget, handleInstallerEvent } from './installer-events';
 import { BackgroundPortal } from './background';
 import { KitInstaller } from './kit-install';
 import { ChatProxy } from './proxy';
@@ -36,7 +37,7 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'beings', privileges: { standard
 // stable while the bundle, windows, menus and dialogs use the display name.
 app.setName(CLIENT_ID);
 app.setAboutPanelOptions({ applicationName: CLIENT_NAME });
-const userData = process.env.PORTAL_DESKTOP_USER_DATA ? path.resolve(process.env.PORTAL_DESKTOP_USER_DATA) : path.join(app.getPath('appData'), CLIENT_ID);
+const userData = clientUserData(app.getPath('appData'), process.env.PORTAL_DESKTOP_USER_DATA);
 app.setPath('userData', userData);
 app.setPath('sessionData', userData);
 let window: BrowserWindow | null = null;
@@ -55,6 +56,8 @@ let sessionEnding = false;
 let tray: Tray | undefined;
 let lifecycleError = '';
 let mutation = Promise.resolve();
+let prepareInstallerShutdown: ((target: string) => void) | undefined;
+let pendingInstallerTarget: string | undefined;
 const exclusive = <T>(operation: () => Promise<T>): Promise<T> => {
   const next = mutation.then(operation);
   mutation = next.then(() => {}, () => {});
@@ -86,10 +89,12 @@ function createWindow() {
     ...(process.platform === 'darwin' ? { vibrancy: 'sidebar' as const, visualEffectState: 'active' as const } : {}),
     ...(acrylic ? { backgroundMaterial: 'acrylic' as const } : {}),
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    autoHideMenuBar: process.platform === 'win32',
     trafficLightPosition: { x: 18, y: 20 },
     webPreferences: { preload: path.join(__dirname, 'preload.js'), sandbox: true, contextIsolation: true,
       nodeIntegration: false, nodeIntegrationInSubFrames: false, webSecurity: true },
   });
+  if (process.platform === 'win32') window.setMenuBarVisibility(false);
   window.webContents.setWindowOpenHandler(({ url }) => { void openExternal(url); return { action: 'deny' }; });
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.on('will-frame-navigate', event => {
@@ -161,6 +166,31 @@ async function ready() {
   let recoveryBlocked = false;
   const clientInstall = new ClientInstall(directory, background);
   const installIntent = await clientInstall.read();
+  prepareInstallerShutdown = target => {
+    void exclusive(async () => {
+      if (quitting) return;
+      const intent = await clientInstall.prepare(app.getVersion(), target, store.connection, portal.managing);
+      try {
+        recoveryBlocked = true;
+        await portal.stop();
+        app.quit();
+      } catch (error) {
+        await clientInstall.resume(intent);
+        recoveryBlocked = false;
+        throw error;
+      }
+    }).catch(error => {
+      if (window && !window.isDestroyed()) void dialog.showMessageBox(window, {
+        type: 'error', title: '无法开始安装', message: String((error as Error).message || error),
+        detail: '旧客户端和 Portal 保持运行。请处理后重新启动安装包。', buttons: ['知道了'],
+      });
+    });
+  };
+  if (pendingInstallerTarget) {
+    const target = pendingInstallerTarget;
+    pendingInstallerTarget = undefined;
+    prepareInstallerShutdown(target);
+  }
   let startupDeferred = false;
   // Only the trusted top-level local shell can control local capabilities.
   const handle = (channel: string, callback: (...args: any[]) => unknown) => {
@@ -168,7 +198,7 @@ async function ready() {
       const frame = event.senderFrame;
       if (!window || event.sender !== window.webContents || frame !== window.webContents.mainFrame || frame.url !== shellURL()) throw new Error('Untrusted IPC sender');
       if (quitting && !['beings:browser-bounds', 'beings:diagnostics'].includes(channel)) throw new Error('客户端正在退出，请稍候。');
-      if (recoveryBlocked && ['beings:save', 'beings:portal-start', 'beings:portal-stop', 'beings:kits-apply'].includes(channel)) throw new Error('Portal 升级恢复尚未完成，请重新启动客户端完成恢复。');
+      if (recoveryBlocked && ['beings:save', 'beings:portal-start', 'beings:portal-stop'].includes(channel)) throw new Error('Portal 升级恢复尚未完成，请重新启动客户端完成恢复。');
       return callback(...args);
     });
   };
@@ -372,17 +402,6 @@ async function ready() {
   }));
   handle('beings:kit-install', (input: KitInstallInput) => exclusive(() => kitInstaller.install(input, store.settings)));
   handle('beings:kit-discard', (ticket: string) => exclusive(() => kitInstaller.discard(ticket)));
-  handle('beings:kits-apply', () => exclusive(async () => {
-    if (!store.connection) throw new Error('请先连接 Being。');
-    await verifyConnection();
-    if (portal.state.managed === false) throw new Error('当前连接的是独立 Portal，请使用原管理方式重启应用 Kits。');
-    if (background.state.enabled) { await background.restart(); await publishBackground(); }
-    else {
-      if (portal.state.phase === 'external') throw new Error('此独立 Portal 未由客户端识别，请等待清单刷新或使用原管理方式重启。');
-      await portal.stop(); await portal.start(store.settings, store.connection);
-    }
-    return portal.state;
-  }));
   handle('beings:kits-open', async () => {
     const { directory } = await kitLocation(store.settings); await mkdir(directory, { recursive: true });
     const error = await shell.openPath(directory); if (error) throw new Error(error);
@@ -395,7 +414,7 @@ async function ready() {
     if (!kit.compatible) throw new Error('这个 Kit 不支持当前系统。');
     const review = await dialog.showMessageBox(window!, { type: 'question', title: '导入 Kit',
       message: `将 ${kit.name} ${kit.version} 导入本机 Portal？`,
-      detail: `${kit.description}\n\n${kit.tools.length} 个工具 · 启动命令：${kit.command.join(' ')}\n目标：${directory}\n\n导入会复制文件；依赖和密钥需要自行配置。重启 Portal 后可用。${kit.eager ? '此 Kit 会在 Portal 启动时自动运行。' : 'Being 调用工具时将以当前用户身份运行此 Kit。'}`,
+      detail: `${kit.description}\n\n${kit.tools.length} 个工具 · 启动命令：${kit.command.join(' ')}\n目标：${directory}\n\n导入会复制文件；依赖和密钥需要自行配置。Portal 会自动刷新清单。${kit.eager ? '此 Kit 会在 Portal 启动时预热。' : 'Being 调用工具时将以当前用户身份运行此 Kit。'}`,
       buttons: ['取消', '导入'], defaultId: 0, cancelId: 0 });
     if (review.response !== 1) return { installed: false };
     const installed = await importLocalKit(choice.filePaths[0], directory);
@@ -466,7 +485,7 @@ async function ready() {
       }).finally(() => { handlingConflict = false; });
     }
   });
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
+  const applicationMenu = Menu.buildFromTemplate([
     ...(process.platform === 'darwin' ? [{ label: CLIENT_NAME, submenu: [
       { role: 'about' as const, label: `关于 ${CLIENT_NAME}` },
       { type: 'separator' as const }, { role: 'services' as const, label: '服务' },
@@ -479,7 +498,10 @@ async function ready() {
     { label: '客户端', submenu: [{ label: '显示主窗口', click: showWindow }, { label: '退出客户端', click: () => app.quit() }] },
     { role: 'editMenu' }, { label: '视图', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     { role: 'windowMenu' }, { label: '帮助', submenu: [{ label: '检查更新…', click: () => { void showUpdates(); } }] },
-  ]));
+  ]);
+  // Windows keeps every command in the in-app options or tray. Removing the
+  // native application menu avoids a second, visually unrelated top bar.
+  Menu.setApplicationMenu(process.platform === 'win32' ? null : applicationMenu);
   const trayIcon = nativeImage.createFromPath(path.join(app.isPackaged ? process.resourcesPath : app.getAppPath(),
     app.isPackaged ? 'branding/app.png' : 'resources/branding/app.png'));
   tray = new Tray(trayIcon.resize({ width: process.platform === 'darwin' ? 18 : 24, height: process.platform === 'darwin' ? 18 : 24 }));
@@ -492,7 +514,13 @@ async function ready() {
   tray.on('click', showWindow);
   tray.on('double-click', showWindow);
   async function restoreStartup(intent: 'manual' | 'automatic' = 'automatic') {
-    if (!store.connection) return;
+    if (!store.connection) {
+      if (installIntent) {
+        await clientInstall.resume(installIntent);
+        runtimeUpdate = { phase: 'current', message: installIntent.from === installIntent.target ? '客户端已重新安装；原 Portal 运行方式已恢复。' : '客户端已更新；连接配置完成后可启动 Portal。' };
+      }
+      return;
+    }
     try { await verifyConnection(); startupDeferred = false; }
     catch (error) {
       startupDeferred = true;
@@ -510,7 +538,9 @@ async function ready() {
           await clientInstall.resume(installIntent);
           if (installIntent.foreground) await portal.start(store.settings, connection);
           else await publishBackground();
-          runtimeUpdate = { phase: 'error', message: '客户端安装未完成，已恢复安装前的 Portal。' };
+          runtimeUpdate = installIntent.from === installIntent.target
+            ? { phase: 'current', message: '客户端已重新安装，已恢复原 Portal。' }
+            : { phase: 'error', message: '客户端安装未完成，已恢复安装前的 Portal。' };
           return;
         }
         const updater = new RuntimeUpdater(directory, background, process.platform, undefined, undefined,
@@ -586,7 +616,17 @@ const squirrelEvent = process.platform === 'win32' ? installerEvent(process.argv
 if (squirrelEvent) { void handleInstallerEvent(squirrelEvent, process.execPath).catch(() => { process.exitCode = 1; }).finally(() => app.quit()); }
 else if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on('second-instance', showWindow);
+  app.on('second-instance', (_event, argv) => {
+    const args = argv ?? [];
+    const target = installerTarget(args);
+    if (target) {
+      if (prepareInstallerShutdown) prepareInstallerShutdown(target);
+      else pendingInstallerTarget = target;
+      return;
+    }
+    if (args.includes('--quit-for-update')) { app.quit(); return; }
+    showWindow();
+  });
   app.whenReady().then(ready).catch(error => { dialog.showErrorBox(`${CLIENT_NAME} 启动失败`, String(error)); app.quit(); });
   app.on('activate', showWindow);
   app.on('window-all-closed', () => { /* Explicit quit owns process cleanup. */ });

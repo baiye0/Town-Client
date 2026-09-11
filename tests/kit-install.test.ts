@@ -3,10 +3,10 @@ import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/
 import path from 'node:path';
 import os from 'node:os';
 import { c as archive } from 'tar';
-import { KitInstaller, archivePath, downloadKit, inspectTools, unpackKit } from '../desktop/kit-install';
+import { KitInstaller, archivePath, dotenv, downloadKit, unpackKit } from '../desktop/kit-install';
 import type { Settings } from '../desktop/shared';
 const dirs: string[] = [];
-afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
+afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); });
 async function fixture(extra = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'beings-install-')); dirs.push(dir);
   const source = path.join(dir, 'source'); await mkdir(source);
@@ -25,34 +25,36 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n'); });`
   const installer = new KitInstaller(dir, async (url, options) => { requests.push([url, options]); return String(url).endsWith('/download') ? new Response(data) : Response.json({ name: manifest.name, version: manifest.version, manifest }); });
   return { dir, source, data, kits, settings, installer, requests };
 }
-it('downloads, verifies real MCP tools and atomically activates a Kit without a manual import', async () => {
+it('downloads and atomically activates a Kit for Portal without a manual import', async () => {
   const f = await fixture(); const plan = await f.installer.prepare('fixture-id', f.settings);
   expect(plan.tools).toBe(1); expect(plan.sha256).toHaveLength(64);
   await expect(stat(path.join(f.kits, plan.name))).rejects.toThrow();
   const result = await f.installer.install({ ticket: plan.ticket, environment: {} }, f.settings);
   expect(result.tools).toBe(1);
   const manifest = JSON.parse(await readFile(path.join(f.kits, plan.name, 'manifest.json'), 'utf8'));
-  expect(manifest.tools[0].description).toBe('真实工具');
+  expect(manifest.tools[0].description).toBe('Ping');
   expect(manifest.tools[0].params.type).toBe('object');
   expect(manifest.command[1]).toBe(path.join(f.kits, plan.name) + '/server.mjs');
   expect(f.requests[0][1].headers.Authorization).toBeUndefined();
   await expect(f.installer.prepare('fixture-id', f.settings)).rejects.toThrow('同名');
 });
-it.skipIf(process.platform === 'win32')('persists scoped environment in a private launcher and the installed launcher speaks MCP', async () => {
+it('persists scoped environment in Portal dotenv without wrapping the command', async () => {
   const f = await fixture({ provision: { env: [{ name: 'FIXTURE_KEY', required: true }] } });
   const plan = await f.installer.prepare('fixture-id', f.settings);
   await expect(f.installer.install({ ticket: plan.ticket, environment: { FIXTURE_KEY: '' } }, f.settings)).rejects.toThrow('请填写');
-  await f.installer.install({ ticket: plan.ticket, environment: { FIXTURE_KEY: "key'with $shell" } }, f.settings);
+  const secret = "key'with $shell\nand a \\\"quote";
+  await f.installer.install({ ticket: plan.ticket, environment: { FIXTURE_KEY: secret } }, f.settings);
   const target = path.join(f.kits, plan.name); const manifest = JSON.parse(await readFile(path.join(target, 'manifest.json'), 'utf8'));
   expect(JSON.stringify(manifest)).not.toContain('key\'with');
-  expect((await stat(path.join(target, '.beings-launch.sh'))).mode & 0o777).toBe(0o600);
-  expect((await inspectTools(manifest.command, target, process.env))[0].name).toBe('ping');
+  expect(await readFile(path.join(target, '.env'), 'utf8')).toBe(dotenv({ FIXTURE_KEY: secret }));
+  expect(manifest.command[0]).toBe(process.execPath);
+  await expect(stat(path.join(target, '.beings-launch.ps1'))).rejects.toThrow();
+  await expect(stat(path.join(target, '.beings-launch.sh'))).rejects.toThrow();
 });
-it('rejects changed settings, failed MCP startup and cancels staging without exposing an installed manifest', async () => {
-  const f = await fixture({ command: ['beings-nonexistent-executable'] });
+it('rejects changed settings and cancels staging without exposing an installed manifest', async () => {
+  const f = await fixture();
   const plan = await f.installer.prepare('fixture-id', f.settings);
   await expect(f.installer.install({ ticket: plan.ticket, environment: {} }, { ...f.settings, portalName: 'changed' })).rejects.toThrow('配置已改变');
-  await expect(f.installer.install({ ticket: plan.ticket, environment: {} }, f.settings)).rejects.toThrow('无法启动');
   await expect(stat(path.join(f.kits, plan.name))).rejects.toThrow();
   await f.installer.discard(plan.ticket);
   await expect(f.installer.install({ ticket: plan.ticket, environment: {} }, f.settings)).rejects.toThrow('已过期');

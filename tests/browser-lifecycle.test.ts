@@ -6,7 +6,7 @@ vi.mock('electron', async () => {
   const { EventEmitter } = await import('node:events');
   class Contents extends EventEmitter {
     destroyed = false;
-    navigationHistory = { canGoBack: () => false, canGoForward: () => false };
+    navigationHistory = { getActiveIndex: () => 0, getAllEntries: () => [{}], goToIndex: vi.fn() };
     isDestroyed() { return this.destroyed; }
     setWindowOpenHandler() {}
     async loadURL() {}
