@@ -2,8 +2,8 @@
 
 - Client: https://github.com/baiye0/loom-local, original base commit `5d347107326fd754fafea1c1dc373a42986ff49f`.
 - Heart Portal: https://github.com/baiye0/heart-portal, Git submodule at `heart-portal/`, tracking `codex/town-client-compat` for explicit source updates.
-- Pinned compatibility revision: `383d915396aef8f7bc1e91e2127271d704288217` on `codex/town-client-compat`.
-- Upstream Portal base: `70191f5` (0.8.2), merged with the existing client compatibility changes. The parent repository's gitlink is the authoritative build revision.
+- Pinned compatibility revision: `94bd6f6d9362c71930aca52f448e73f056ab7b40` on `codex/town-client-compat`.
+- Upstream Portal base: `79657ab` (0.8.2), including the Windows screenshot fix and removal of built-in web search, merged with the existing client compatibility changes. The parent repository's gitlink is the authoritative build revision.
 
 The compatibility branch is based on upstream main. It keeps client-managed
 launches in place, publishes connection state on both platforms, and prevents
@@ -27,6 +27,3 @@ To intentionally update Portal: run `git submodule update --remote heart-portal`
 verify the client and engine together, then commit the `heart-portal` gitlink in
 Portal Desktop. Retain the original license notices in `heart-portal/LICENSE` and
 `resources/HEART-PORTAL-LICENSE`.
-
-The `hardening/` directory contains historical design and verification notes from
-the original workspace; they are not a description of the current source layout.
