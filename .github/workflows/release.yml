@@ -1,6 +1,5 @@
 name: Build paired client release
 on:
-  workflow_dispatch:
   push:
     tags: ['v*']
 permissions:
@@ -84,5 +83,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "Portal Desktop $GITHUB_REF_NAME" --notes-file desktop/RELEASE_NOTES.md
           gh release upload "$GITHUB_REF_NAME" release/*
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
-# Manual workflow runs only build and test. A version tag publishes after both
-# native builds pass; the release stays a draft if asset upload fails.
+# Only a matching version tag builds and publishes. Publication waits for both
+# native builds; the release stays a draft if asset upload fails.
