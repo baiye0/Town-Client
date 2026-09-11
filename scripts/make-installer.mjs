@@ -18,7 +18,7 @@ if (process.platform === 'win32') {
       win: { icon: 'resources/branding/app.ico', signAndEditExecutable: false },
       nsis: {
         oneClick: false, perMachine: false, allowElevation: false,
-        allowToChangeInstallationDirectory: true,
+        allowToChangeInstallationDirectory: false,
         runAfterFinish: true, deleteAppDataOnUninstall: false,
         artifactName: 'portal-desktop-${version}-windows-x64-Setup.exe',
         include: 'scripts/installer.nsh',

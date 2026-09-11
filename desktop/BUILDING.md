@@ -78,7 +78,7 @@ macOS 可将解压后的 `Portal Desktop.app` 放到 Applications 或稳定的�
 
 ### Windows 安装包的明确边界
 
-Windows 使用 electron-builder 的 NSIS 安装向导，提供目录选择、进度和完成页。安装前确认关闭运行中的客户端及 Portal，沿用安装恢复记录，完成页只启动一次客户端。应用内升级通过 `/S /D=<当前目录>` 保持安装位置，由升级助手启动一次新版；用户配置独立存储，卸载不删除配置。普通 CI 只测试，推送匹配客户端版本的 `v*` tag 才生成并发布 Windows/macOS 安装包。
+Windows 使用 electron-builder 的 NSIS 安装向导，使用默认目录，提供安装进度和完成页，不显示目录选择页；升级已有 NSIS 安装时沿用原目录。安装前确认关闭运行中的客户端及 Portal，沿用安装恢复记录，完成页只启动一次客户端。应用内升级通过 `/S /D=<当前目录>` 保持安装位置，由升级助手启动一次新版；用户配置独立存储，卸载不删除配置。普通 CI 只测试，推送匹配客户端版本的 `v*` tag 才生成并发布 Windows/macOS 安装包。
 
 当前未配置 macOS Developer ID、公证或 Windows Authenticode。客户端支持用户主动下载并安装更新。操作系统可能提示来源未验证；正式公开发布前应配置签名并在目标系统验收。Electron 的下载校验不等于应用代码签名。
 
