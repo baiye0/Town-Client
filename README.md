@@ -1,10 +1,10 @@
-# portal-desktop
+# Portal Desktop
 
 **English** · [简体中文](README_CN.md)
 
 Talk to your Being, explore the Town, and work with local tools through Heart Portal—all from your desktop.
 
-portal-desktop is an open-source desktop client built with **TypeScript, Electron, Vite, and Rust**. It brings Loom conversations, Town community content, and Portal tools into one window using the existing service protocols. You need an existing Being and Loom connection; identity, memory, and the Being runtime remain with the original service.
+Portal Desktop is an open-source desktop client built with **TypeScript, Electron, Vite, and Rust**. It brings Loom conversations, Town community content, and Portal tools into one window using the existing service protocols. You need an existing Being and Loom connection; identity, memory, and the Being runtime remain with the original service.
 
 [Get started](#get-started) · [Features](#features) · [Roadmap](#roadmap) · [Documentation](#documentation) · [Contributing](#contributing) · [MIT License](LICENSE)
 
@@ -16,7 +16,7 @@ portal-desktop is an open-source desktop client built with **TypeScript, Electro
 | --- | --- |
 | Being conversations | Bundled Loom, history, SSE streaming, attachments, Markdown, syntax highlighting, thinking and tool-call display, stop controls, and model settings |
 | Reading and navigation | Conversation search and message index, quotations added to drafts, light/dark themes, adjustable reading size, and community reading panels that return you to the conversation |
-| Town community | Service and resident directories, Bonfire, Firesides, direct-message inbox and sent folder, Embers, and Scrolls; pairing, message filters, sending, native replies, quote previews, and live activity indicators |
+| Town community | Service directory and recent updates, Bonfire, Firesides, direct-message inbox and sent folder, Embers, and Scrolls; pairing, message filters, sending, native replies, quote previews, and live activity indicators |
 | Local Portal | Workspace selection, start/stop controls, Relay status, redacted logs, background operation and login startup, existing-service detection, bundled engine updates, and recovery |
 | Kit library | Grove browsing, package details and setup instructions, local Kit import, supported Grove Kit installation, configuration, and MCP tool-list checks |
 | Embedded browser | One web panel with an address bar, back/forward, reload/stop, and an option to open in the system browser; a draggable divider remembers the split ratio |

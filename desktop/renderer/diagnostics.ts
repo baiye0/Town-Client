@@ -7,7 +7,7 @@ export function mountDiagnostics(api: DesktopAPI, report: (error: unknown) => vo
     refresh.disabled = true; list.textContent = '正在检查连接与本机状态…';
     try {
       const state = await api.diagnostics(); if (!dialog.open) return;
-      document.getElementById('diagnostics-version')!.textContent = `portal-desktop ${state.version} · ${state.platform}\n构建 ${state.build}\n主进程 ${state.pid} · 启动 ${new Date(state.startedAt).toLocaleString()}`;
+      document.getElementById('diagnostics-version')!.textContent = `Portal Desktop ${state.version} · ${state.platform}\n构建 ${state.build}\n主进程 ${state.pid} · 启动 ${new Date(state.startedAt).toLocaleString()}`;
       list.replaceChildren();
       for (const check of state.checks) {
         const row = document.createElement('div'); row.className = 'diagnostic-row'; row.dataset.status = check.status;

@@ -46,7 +46,7 @@ jobs:
           if gh release view "$RELEASE_TAG" --json isDraft > existing-release.json; then
             node -e 'if (!require("./existing-release.json").isDraft) throw new Error("Refusing to replace a published release")'
           else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "portal-desktop $RELEASE_TAG" --notes-file release-notes.md
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Portal Desktop $RELEASE_TAG" --notes-file release-notes.md
           fi
           gh release upload "$RELEASE_TAG" release/* --clobber
           gh release edit "$RELEASE_TAG" --draft=false --latest

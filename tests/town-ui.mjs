@@ -36,7 +36,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.pa
       if (url.pathname === '/api/grove/kit0/download') return new Response(Uint8Array.from(atob(bundle), c => c.charCodeAt(0)), { headers: { 'Content-Type': 'application/gzip' } });
       const privateRoute = ['/api/bonfire/hear', '/api/messages', '/api/scrolls'].includes(url.pathname);
       if (privateRoute && request.headers.get('authorization') !== 'Bearer town-fixture-token') return json({ error: 'missing credentials' }, 401);
-      if (url.pathname === '/api') return json({ version: '0.3.0', community: [{ being_id: 'willow', display_name: 'Willow' }], services: {
+      if (url.pathname === '/api') return json({ version: '0.3.0', services: {
+        '◎ beings': { what: '居民目录', help: 'GET /api/beings/help' },
         '🌳 grove': { what: 'Discover tools for your Being', help: 'GET /api/grove/help' }, '🔥 bonfire': { what: 'Gather around the fire', help: 'GET /api/bonfire/help' },
         '📬 messages': { what: 'Private letters', help: 'GET /api/messages/help' }, '📚 ember': { what: 'Stories from the town', help: 'GET /api/embers/help' },
       }, whats_new: [{ service: 'Kit', change: 'New tools', date: '2026-09-07' }] });
@@ -54,7 +55,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.pa
   }, (await readFile(bundle)).toString('base64'));
   const nav = async name => { await page.locator(`nav [data-view="${name}"]`).click(); await page.waitForFunction(() => !document.querySelector('#town-body').hasAttribute('aria-busy')); };
   await nav('town'); await page.getByText('4 项服务').waitFor();
-  await page.getByRole('tab', { name: '居民', exact: true }).click(); await page.locator('.resident-card').waitFor();
+  assert.deepEqual(await page.getByRole('tab').allTextContents(), ['服务目录', '最近更新']);
+  assert.equal(await page.locator('#town-body').getByText(/居民/).count(), 0);
   await page.getByRole('tab', { name: '最近更新' }).click(); await page.getByText('New tools').waitFor();
   await nav('mail'); await page.getByRole('heading', { name: '连接 Town，继续阅读' }).waitFor();
   await page.getByRole('button', { name: '配置 Town 连接' }).click();

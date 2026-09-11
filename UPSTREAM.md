@@ -13,11 +13,11 @@ Client packaging compiles the pinned source on the target operating system and
 ships the resulting engine inside the same client release.
 
 Clone with `git clone --recurse-submodules`, or initialize an existing clone with
-`git submodule update --init --recursive`. After pulling portal-desktop, run the latter
+`git submodule update --init --recursive`. After pulling Portal Desktop, run the latter
 command again to use its recorded Portal revision. Builds never follow a moving
 branch or run `git pull` automatically.
 
-Keep all portal-desktop compatibility changes on the long-lived
+Keep all Portal Desktop compatibility changes on the long-lived
 `codex/town-client-compat` branch in the Portal repository. Merge upstream updates
 into that branch, verify the client and engine together, and publish the Portal
 commit before updating the client gitlink. Do not point the client at a temporary
@@ -25,7 +25,7 @@ local branch or directly at upstream main.
 
 To intentionally update Portal: run `git submodule update --remote heart-portal`,
 verify the client and engine together, then commit the `heart-portal` gitlink in
-portal-desktop. Retain the original license notices in `heart-portal/LICENSE` and
+Portal Desktop. Retain the original license notices in `heart-portal/LICENSE` and
 `resources/HEART-PORTAL-LICENSE`.
 
 The `hardening/` directory contains historical design and verification notes from

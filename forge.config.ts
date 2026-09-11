@@ -9,7 +9,8 @@ const binary = path.resolve('resources', process.platform === 'win32' ? 'heart-p
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
-    executableName: 'portal-desktop',
+    // Packager also derives macOS's display name from its executable name.
+    executableName: process.platform === 'darwin' ? 'Portal Desktop' : 'portal-desktop',
     appBundleId: 'town.beings.portal-desktop',
     icon: path.resolve('resources/branding/app'),
     extraResource: [binary, path.resolve('resources/HEART-PORTAL-LICENSE'), path.resolve('resources/branding'), path.resolve('resources/runtime-bundle.json')],

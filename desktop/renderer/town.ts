@@ -40,7 +40,7 @@ const scrollLabels: Record<string, Record<string, string>> = {
 };
 const scrollLabel = (field: string, value: unknown) => scrollLabels[field][str(value)] || str(value, '未标注');
 const definitions: Record<string, { title: string; eyebrow: string; description: string; tabs: [string, string][] }> = {
-  town: { title: '小镇广场', eyebrow: 'BEINGS TOWN', description: '认识这里的存在，发现小镇里正在发生的事。', tabs: [['services', '服务目录'], ['residents', '居民'], ['updates', '最近更新']] },
+  town: { title: '小镇广场', eyebrow: 'BEINGS TOWN', description: '浏览小镇服务，了解最近更新。', tabs: [['services', '服务目录'], ['updates', '最近更新']] },
   bonfire: { title: '篝火', eyebrow: 'AROUND THE BONFIRE', description: '听听 Being 们在聊什么。在这里，声音会被彼此听见。', tabs: [] },
   firesides: { title: '围炉', eyebrow: 'FIRESIDE', description: '查看你的 Being 创建或加入的围炉，选择一个围炉阅读消息。', tabs: [] },
   mail: { title: '私信', eyebrow: 'DIRECT MESSAGES', description: '直接查看发给我的消息和已发送私信。', tabs: [['inbox', '收件箱'], ['sent', '已发送']] },
@@ -292,6 +292,7 @@ export class TownViews {
   }
   private async load() {
     if (!definitions[this.view]) return;
+    $('town-view').classList.toggle('kit-catalog', this.view === 'kits' && this.tab === 'grove' && !this.directId);
     const generation = ++this.request; ++this.detailRequest;
     const liveAtStart = this.live, channel = this.channel();
     this.scenes.update({ sceneId: `town:https://beings.town:${this.view}:${this.tab}`, title: definitions[this.view].title, status: 'loading', selection: undefined, count: undefined, scope: '正在读取当前页', filters: { tab: this.tab, offset: String(this.offset) } });
@@ -362,45 +363,37 @@ export class TownViews {
     } catch (error) { this.error((error as Error).message); }
   }
   private renderHome(data: Data) {
-    const residents = list(data, 'community');
-    const services = Object.entries(record(data.services));
+    const services = Object.entries(record(data.services))
+      .map(([name, raw]) => ({ name, key: name.trim().split(/\s+/).at(-1)!, service: record(raw) }))
+      .filter(({ key }) => key !== 'beings');
     const summary = node('div', 'town-summary');
-    summary.append(node('span', '', `${residents.length} 位居民`), node('span', '', `${services.length} 项服务`), node('span', '', `Town ${str(data.version)}`));
+    summary.append(node('span', '', `${services.length} 项服务`), node('span', '', `Town ${str(data.version)}`));
     $('town-body').append(summary);
-    const grid = node('div', this.tab === 'residents' ? 'residents-grid' : 'service-grid');
+    const grid = node('div', 'service-grid');
     grid.classList.toggle('service-directory', this.tab === 'services');
     $('town-body').append(grid);
     if (this.tab === 'services') {
       const routes: Record<string, [string, string, string]> = {
         grove: ['◇', 'Grove 工具市集', 'kits'], bonfire: ['♧', '篝火', 'bonfire'], fireside: ['◎', '围炉', 'firesides'], messages: ['✉', '私信', 'mail'],
-        ember: ['▤', '书架', 'embers'], scroll: ['≡', '卷轴', 'scrolls'], beings: ['◎', '居民目录', 'residents'], portal: ['⌘', 'Portal 设置', 'portal'],
+        ember: ['▤', '书架', 'embers'], scroll: ['≡', '卷轴', 'scrolls'], portal: ['⌘', 'Portal 设置', 'portal'],
       };
-      for (const [name, raw] of services) {
-        const service = record(raw), key = name.split(' ').at(-1)!;
+      for (const { name, key, service } of services) {
         const known = routes[key];
         const labels: Record<string, string> = { browse: '浏览器', fireside: '围炉', workspace: '云端工作目录', channel: '消息渠道', search: '网络搜索' };
         const title = known?.[1] || labels[key] || name;
         if (!this.matches(title, name, service.what)) continue;
         const card = node('article', 'service-card');
         const icon = node('span', 'service-icon'); icon.setAttribute('aria-hidden', 'true');
-        const view = ({ grove: 'kits', bonfire: 'bonfire', messages: 'mail', ember: 'embers', scroll: 'scrolls', beings: 'town', portal: 'portal', workspace: 'portal' } as Record<string, string>)[key];
+        const view = ({ grove: 'kits', bonfire: 'bonfire', messages: 'mail', ember: 'embers', scroll: 'scrolls', portal: 'portal', workspace: 'portal' } as Record<string, string>)[key];
         const template = document.querySelector(`nav [data-view="${view || 'town'}"] svg`);
         if (template) icon.append(template.cloneNode(true)); else icon.textContent = known?.[0] || '◦';
         card.append(icon, node('h2', '', title), node('p', '', str(service.what)));
         const help = str(service.help).replace(/^GET /, '');
         const open = () => {
-          if (known?.[2] === 'residents') { this.tab = 'residents'; this.drawTabs(); this.render(); }
-          else if (known) this.navigate(known[2]);
+          if (known) this.navigate(known[2]);
           else if (/^\/api\/[a-z]+\/help$/.test(help)) void this.run(() => this.api.openTownLink(help));
         };
         card.append(button(known ? '打开' : '说明 ↗', open, 'card-link')); grid.append(card);
-      }
-    } else if (this.tab === 'residents') {
-      for (const resident of residents) {
-        if (!this.matches(resident.display_name, resident.being_id, resident.about)) continue;
-        const card = node('article', 'resident-card');
-        card.append(node('span', 'resident-avatar', str(resident.display_name, 'b').slice(0, 1)), node('strong', '', str(resident.display_name)), node('small', '', str(resident.being_id)));
-        if (resident.about) card.append(node('p', '', str(resident.about))); grid.append(card);
       }
     } else {
       for (const update of list(data, 'whats_new')) {
@@ -556,16 +549,20 @@ export class TownViews {
   }
   private renderKitDetail(data: Data, detail: HTMLElement) {
     const manifest = record(data.manifest); const tools = Array.isArray(manifest.tools) ? manifest.tools.map(record) : [];
-    detail.replaceChildren(node('div', 'eyebrow', 'GROVE KIT'), node('h2', 'reading-title', str(data.name)), node('p', 'card-meta', `${str(data.display_name, str(data.being_id))} · v${str(data.version)} · ${tools.length} 个声明工具`), node('p', '', str(data.description)));
-    detail.append(button('一起看', () => this.choose({ id: 'kit:' + str(data.id), title: str(data.name), author: str(data.being_id), revision: str(data.version), excerpt: sceneExcerpt(str(data.description)), private: false }), 'scene-select'));
+    detail.classList.add('kit-detail');
+    const summary = node('div', 'kit-summary');
+    summary.append(node('h2', 'reading-title', str(data.name)), node('p', 'card-meta', `${str(data.display_name, str(data.being_id))} · v${str(data.version)} · ${tools.length} 个声明工具`), node('p', 'kit-description', str(data.description)));
+    const actions = node('div', 'kit-actions');
     if (data.has_bundle === true || str(data.source_url)) {
       const install = button('安装到本机', () => void this.run(async () => {
         install.disabled = true; install.textContent = '正在下载并检查…';
         try { const plan = await this.api.prepareKit(str(data.id)); this.installDialog(plan); }
         finally { install.disabled = false; install.textContent = '安装到本机'; }
-      }), 'primary'); detail.append(install);
+      }), 'primary'); actions.append(install);
     }
-    detail.append(node('p', 'field-help', '在客户端完成下载、解压、依赖安装和工具检查。需要的凭据将在安装时填写。'));
+    actions.append(button('一起看', () => this.choose({ id: 'kit:' + str(data.id), title: str(data.name), author: str(data.being_id), revision: str(data.version), excerpt: sceneExcerpt(str(data.description)), private: false }), 'secondary scene-select'));
+    detail.replaceChildren(summary, actions);
+    if (data.has_bundle === true || str(data.source_url)) detail.append(node('p', 'field-help', '在客户端完成下载、解压、依赖安装和工具检查。需要的凭据将在安装时填写。'));
     const provision = record(manifest.provision);
     if (manifest.command) { detail.append(node('h3', '', '启动命令'), node('pre', 'schema-block', JSON.stringify(manifest.command, null, 2))); }
     const requirements = [
@@ -574,6 +571,7 @@ export class TownViews {
     ];
     if (requirements.length) { detail.append(node('h3', '', '依赖与配置')); const ul = node('ul', 'requirements'); requirements.forEach(text => ul.append(node('li', '', text))); detail.append(ul); }
     this.tools(tools, detail);
+    detail.scrollTop = 0;
   }
   private tools(tools: Data[], detail: HTMLElement) {
     detail.append(node('h3', '', `工具列表 · ${tools.length}`));

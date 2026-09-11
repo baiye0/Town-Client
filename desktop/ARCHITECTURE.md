@@ -1,4 +1,4 @@
-# portal-desktop 桌面架构
+# Portal Desktop 桌面架构
 
 参考 Codex 的「桌面 UI / 本地引擎分离」模式。OpenAI 的公开
 [App Server 文档](https://learn.chatgpt.com/docs/app-server)描述了富客户端使用独立引擎、

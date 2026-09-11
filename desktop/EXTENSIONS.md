@@ -115,6 +115,6 @@ Portal 的 `manifest.json` 保持原格式。未来界面信息使用独立的 `
 
 ## 参考与兼容边界
 
-Codex 的可借鉴之处是把可分发包、工具、使用说明和可选界面分开，并提供统一的安装管理体验，见 [官方插件架构](https://developers.openai.com/plugins/concepts/plugins) 和 [插件管理说明](https://learn.chatgpt.com/docs/plugins)。本方案的插件格式和客户端接口是 portal-desktop 的拟议设计，不宣称直接兼容 Codex 插件包、账号连接或其宿主 API。
+Codex 的可借鉴之处是把可分发包、工具、使用说明和可选界面分开，并提供统一的安装管理体验，见 [官方插件架构](https://developers.openai.com/plugins/concepts/plugins) 和 [插件管理说明](https://learn.chatgpt.com/docs/plugins)。本方案的插件格式和客户端接口是 Portal Desktop 的拟议设计，不宣称直接兼容 Codex 插件包、账号连接或其宿主 API。
 
 如将来接入 MCP Apps UI，应先核对当时的标准以及 Portal 对资源和 UI 元数据的实际支持，再决定适配路径；当前 stdio 工具调用链本身不代表已经支持该界面协议。

@@ -81,7 +81,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "portal-desktop $GITHUB_REF_NAME" --notes-file desktop/RELEASE_NOTES.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --title "Portal Desktop $GITHUB_REF_NAME" --notes-file desktop/RELEASE_NOTES.md
           gh release upload "$GITHUB_REF_NAME" release/*
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
 # Manual workflow runs only build and test. A version tag publishes after both

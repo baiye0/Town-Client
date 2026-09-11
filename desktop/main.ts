@@ -28,11 +28,15 @@ declare const MAIN_WINDOW_VITE_NAME: string;
 declare const PORTAL_DESKTOP_UPDATE_REPOSITORY: string;
 declare const PORTAL_DESKTOP_BUILD: string;
 const startedAt = new Date().toISOString();
-const CLIENT_NAME = 'portal-desktop';
+const CLIENT_NAME = 'Portal Desktop';
+const CLIENT_ID = 'portal-desktop';
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'beings', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
-app.setName(CLIENT_NAME);
-const userData = process.env.PORTAL_DESKTOP_USER_DATA ? path.resolve(process.env.PORTAL_DESKTOP_USER_DATA) : path.join(app.getPath('appData'), CLIENT_NAME);
+// Electron uses its internal name for encrypted storage. Keep that identity
+// stable while the bundle, windows, menus and dialogs use the display name.
+app.setName(CLIENT_ID);
+app.setAboutPanelOptions({ applicationName: CLIENT_NAME });
+const userData = process.env.PORTAL_DESKTOP_USER_DATA ? path.resolve(process.env.PORTAL_DESKTOP_USER_DATA) : path.join(app.getPath('appData'), CLIENT_ID);
 app.setPath('userData', userData);
 app.setPath('sessionData', userData);
 let window: BrowserWindow | null = null;
@@ -463,7 +467,15 @@ async function ready() {
     }
   });
   Menu.setApplicationMenu(Menu.buildFromTemplate([
-    ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const }] : []),
+    ...(process.platform === 'darwin' ? [{ label: CLIENT_NAME, submenu: [
+      { role: 'about' as const, label: `关于 ${CLIENT_NAME}` },
+      { type: 'separator' as const }, { role: 'services' as const, label: '服务' },
+      { type: 'separator' as const },
+      { role: 'hide' as const, label: `隐藏 ${CLIENT_NAME}` },
+      { role: 'hideOthers' as const, label: '隐藏其他应用' },
+      { role: 'unhide' as const, label: '显示全部' },
+      { type: 'separator' as const }, { role: 'quit' as const, label: `退出 ${CLIENT_NAME}` },
+    ] }] : []),
     { label: '客户端', submenu: [{ label: '显示主窗口', click: showWindow }, { label: '退出客户端', click: () => app.quit() }] },
     { role: 'editMenu' }, { label: '视图', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     { role: 'windowMenu' }, { label: '帮助', submenu: [{ label: '检查更新…', click: () => { void showUpdates(); } }] },

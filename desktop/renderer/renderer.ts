@@ -295,7 +295,7 @@ document.addEventListener('keydown', event => {
   if ((event.metaKey || event.ctrlKey) && event.key === ',') { event.preventDefault(); showSettings(); }
 });
 if (navigator.userAgent.includes('Windows')) document.querySelector('#toggle-chat-search small')!.textContent = 'Ctrl F';
-if (!api) toast('请通过 portal-desktop 桌面客户端打开此页面。');
+if (!api) toast('请通过 Portal Desktop 桌面客户端打开此页面。');
 else {
   document.documentElement.dataset.platform = api.platform;
   api.onPortal(state => { renderPortal(state); void action(async () => applySnapshot(await api.snapshot())); });

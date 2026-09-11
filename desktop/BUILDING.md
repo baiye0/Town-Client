@@ -30,7 +30,7 @@ npm start
 
 ### 更新 Portal
 
-运行 `git submodule update --remote heart-portal` 显式取得兼容分支 `codex/town-client-compat` 的最新提交。兼容分支合入原仓库 `main` 的更新，仅保留客户端必要的生命周期适配。验证客户端和引擎后，在 portal-desktop 中提交子模块引用并更新 `UPSTREAM.md`。构建只使用锁定提交，不自动拉取远端代码；Portal 的编译、安装包与发布均跟随客户端。
+运行 `git submodule update --remote heart-portal` 显式取得兼容分支 `codex/town-client-compat` 的最新提交。兼容分支合入原仓库 `main` 的更新，仅保留客户端必要的生命周期适配。验证客户端和引擎后，在 Portal Desktop 中提交子模块引用并更新 `UPSTREAM.md`。构建只使用锁定提交，不自动拉取远端代码；Portal 的编译、安装包与发布均跟随客户端。
 
 仓库不提交 `node_modules/`、Portal 二进制、生成的网页资产或 `out/`。`npm ci` 根据 `package-lock.json` 安装依赖；首次构建需要联网下载 Electron、npm 包和 Cargo 依赖。`npm start` 先生成离线网页资产，再启动开发模式。
 
@@ -66,15 +66,15 @@ npm run make
 
 | 命令 / 平台 | 输出位置（`<arch>` 为当前架构，`<version>` 为桌面版本） |
 | --- | --- |
-| package / macOS | `out/portal-desktop-darwin-<arch>/portal-desktop.app` |
-| package / Windows | `out/portal-desktop-win32-<arch>/portal-desktop.exe`，必须连同所在目录的其他文件使用 |
-| package / Linux | `out/portal-desktop-linux-<arch>/portal-desktop`，必须连同所在目录的其他文件使用 |
-| make / ZIP | `out/make/zip/<platform>/<arch>/portal-desktop-<platform>-<arch>-<version>.zip` |
-| make / Windows Setup | `out/make/squirrel.windows/<arch>/portal-desktop-<version> Setup.exe`，同目录另有 `RELEASES` 和 `portal-desktop-<version>-full.nupkg` |
+| package / macOS | `out/Portal Desktop-darwin-<arch>/Portal Desktop.app` |
+| package / Windows | `out/Portal Desktop-win32-<arch>/portal-desktop.exe`，必须连同所在目录的其他文件使用 |
+| package / Linux | `out/Portal Desktop-linux-<arch>/portal-desktop`，必须连同所在目录的其他文件使用 |
+| make / ZIP | `out/make/zip/<platform>/<arch>/Portal Desktop-<platform>-<arch>-<version>.zip` |
+| make / Windows Setup | `out/make/squirrel.windows/<arch>/Portal Desktop-<version> Setup.exe`，同目录另有 `RELEASES` 和 `portal-desktop-<version>-full.nupkg` |
 
 ZIP 含完整应用目录和内置 Portal。不要只拷贝 Windows 的单个 exe 或 macOS `.app` 中的单个可执行文件。当前没有 DMG、MSI、AppImage、deb/rpm。版本标签触发 macOS / Windows 配套构建，全部验证通过后才发布 GitHub Release。
 
-macOS 可将解压后的 `portal-desktop.app` 放到 Applications 或稳定的用户目录再启动。Windows ZIP 应解压到当前用户可写的稳定目录再运行 `portal-desktop.exe`，不要直接在压缩包预览里启动。
+macOS 可将解压后的 `Portal Desktop.app` 放到 Applications 或稳定的用户目录再启动。Windows ZIP 应解压到当前用户可写的稳定目录再运行 `portal-desktop.exe`，不要直接在压缩包预览里启动。
 
 ### Windows 安装包的明确边界
 
