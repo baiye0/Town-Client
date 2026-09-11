@@ -50,7 +50,7 @@ Town 使用独立配对身份，不从 Loom 连接推测授权。可用 Being �
 
 ### Portal 与 Kit
 
-Portal 作为独立 Rust 进程运行，源码通过 Git 子模块锁定，与客户端一起构建和发布。文件工具与搜索使用所选工作目录；命令执行和 Kits 默认关闭，按需开启。
+Portal 作为独立 Rust 进程运行，源码通过 Git 子模块锁定，与客户端一起构建和发布。文件工具与搜索使用所选工作目录；命令执行默认开启，与原生 Portal 一致，可在连接设置中关闭。Kits 默认关闭，按需开启。已有配置沿用原来的工具设置。
 
 Kit 工具沿用 Portal 的 MCP 调用链。当前安装器支持 Grove / GitHub 托管的 `tar.gz`、stdio Kit，以及 `package.json` / `requirements.txt` 依赖安装；Node、Python 或其他运行时需预先准备。安装前展示配置和依赖，经过 MCP `initialize` / `tools/list` 检查后完成安装。本地目录导入不运行安装脚本、不覆盖同名 Kit；自定义 `provision.install` / `post_install` 不自动执行。
 

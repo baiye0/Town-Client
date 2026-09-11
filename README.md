@@ -50,7 +50,7 @@ The event stream subscribes to activity after confirming identity. It reconnects
 
 ### Portal and Kits
 
-Portal runs as a separate Rust process. Its source is pinned through a Git submodule and built and distributed with the client. File tools and search use the selected workspace. Command execution and Kits are disabled by default and can be enabled as needed.
+Portal runs as a separate Rust process. Its source is pinned through a Git submodule and built and distributed with the client. File tools and search use the selected workspace. Command execution is enabled by default, matching native Portal, and can be disabled in connection settings. Kits remain disabled by default and can be enabled as needed. Existing configurations retain their tool settings.
 
 Kit tools use Portal's existing MCP call path. The installer currently supports Grove / GitHub-hosted `tar.gz` packages, stdio Kits, and dependency installation from `package.json` or `requirements.txt`. Prepare Node, Python, or other required runtimes separately. Installation presents configuration and dependencies, then checks MCP `initialize` / `tools/list` before completing. Local directory import does not run installation scripts or overwrite a Kit with the same name. Custom `provision.install` / `post_install` commands are not run automatically.
 
